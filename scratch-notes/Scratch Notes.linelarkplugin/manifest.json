@@ -1,0 +1,10 @@
+{
+  "id": "com.linelark.example.notes",
+  "name": "Scratch Notes",
+  "version": "1.0.0",
+  "apiVersion": 1,
+  "main": "main.js",
+  "author": "Linelark",
+  "description": "A right-dock panel listing the TODOs in the file you are looking at.",
+  "pricing": "free"
+}

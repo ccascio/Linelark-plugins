@@ -1,0 +1,10 @@
+{
+  "id": "com.linelark.example.github",
+  "name": "GitHub",
+  "version": "1.0.0",
+  "apiVersion": 1,
+  "main": "main.js",
+  "author": "Linelark",
+  "description": "A repository tree and commit graph for the open folder, read from local git.",
+  "pricing": "free"
+}

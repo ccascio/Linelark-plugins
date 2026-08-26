@@ -1,0 +1,10 @@
+{
+  "id": "com.linelark.example.sortlines",
+  "name": "Sort Lines",
+  "version": "1.0.0",
+  "apiVersion": 1,
+  "main": "main.js",
+  "author": "Linelark",
+  "description": "Sorts the selected lines, and drops duplicates on request.",
+  "pricing": "free"
+}
