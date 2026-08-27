@@ -17,7 +17,8 @@ release of the editor.
 | Plugin | Shows |
 | --- | --- |
 | [`sort-lines`](sort-lines/) | Editing: expand a selection to whole lines, compute the result, apply it as one undoable edit |
-| [`github`](github/) | A side panel — file tree and commit graph from local git — and an asynchronous click that opens a revision beside the working copy |
+| [`document-preview`](document-preview/) | Rendering: Markdown and HTML drawn in place of their source, two previews from one plugin, each block carrying the offset it came from so the switch keeps your place |
+| [`github`](github/) | A git client: stage, commit, pull, push, diffs of what has changed, branches, and pull requests from the API. The one that asks for permissions, and the one to read for what a real panel looks like |
 | [`scratch-notes`](scratch-notes/) | A right-dock panel that reads the front file and moves the caret when a row is clicked |
 
 Each folder holds a `README.md` and the `.linelarkplugin` bundle itself. The bundle is what
@@ -49,11 +50,19 @@ timers and promises, and the limits worth knowing before designing around them �
 
 ## Requirements
 
-`apiVersion` 1. Read-only git (`repoIsAvailable`, `repoLog`, `repoFiles`, `repoShow` and
-their `*Async` forms) is Studio-only: the sandbox blocks subprocesses, so the App Store
-edition does not ship the git reader and `repoIsAvailable()` answers `false` there. A
-plugin that uses it should check and explain itself rather than showing an empty panel.
+`apiVersion` 1. Git is Studio-only: the sandbox blocks subprocesses, so the App Store edition
+does not ship the git reader at all and `repoIsAvailable()` answers `false` there. A plugin
+that uses it should check and explain itself rather than showing an empty panel.
+
+Reading git needs no permission — it describes the folder you opened. *Changing* it does: a
+plugin declares `"git": "write"` in its manifest and the user switches it on in Manage
+Plugins. Nothing in the API can force-push, reset, discard or merge, and `repoPullAsync` is
+fast-forward only, so the worst a granted plugin can do is make a commit you did not want —
+which is in the reflog like any other.
 
 ## Licence
 
 MIT. Copy from these freely.
+
+`document-preview` also contains [marked](https://github.com/markedjs/marked) v15.0.7,
+copyright (c) 2011-2025 Christopher Jeffrey, likewise MIT. Its HTML parser is our own.

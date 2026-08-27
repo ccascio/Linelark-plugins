@@ -1,10 +1,21 @@
 {
   "id": "com.linelark.example.github",
   "name": "GitHub",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "apiVersion": 1,
   "main": "main.js",
   "author": "Linelark",
-  "description": "A repository tree and commit graph for the open folder, read from local git.",
-  "pricing": "free"
+  "description": "A git client in the side panel: stage, commit, pull, push, and read diffs — plus pull requests and checks from github.com.",
+  "pricing": "free",
+  "git": "write",
+  "hosts": ["api.github.com"],
+  "secrets": [
+    {
+      "name": "token",
+      "label": "GitHub token",
+      "header": "Authorization",
+      "prefix": "Bearer ",
+      "host": "api.github.com"
+    }
+  ]
 }
