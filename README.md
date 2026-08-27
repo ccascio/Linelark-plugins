@@ -46,7 +46,7 @@ printed with `linelark.log` or `console.log`.
 
 The full guide — the manifest format, the whole `linelark` API, panels, generated buffers,
 timers and promises, and the limits worth knowing before designing around them — is at
-**<https://linelark.com/plugins/>**.
+**<https://linelark.com/plugins/developers/>**.
 
 ## Requirements
 
