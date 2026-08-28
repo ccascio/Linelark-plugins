@@ -92,4 +92,4 @@ The history graph is capped at 120 commits, and the check-run roll-up describes 
 `repoUnstageAsync`, `repoCommitAsync`, `repoFetchAsync`, `repoPullAsync`, `repoPushAsync`,
 `repoSwitchAsync`, `repoCreateBranchAsync`.
 
-Panel nodes: `rows`, `heading`, `text`, `graph`, `field`.
+Panel nodes: `rows`, `tree`, `heading`, `text`, `graph`, `field`.

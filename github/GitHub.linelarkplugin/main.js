@@ -31,6 +31,10 @@ var state = {
     outcome: null,
     message: "",
     branch: "",
+    // Flat names with their folder underneath, or the folder structure itself. Both are
+    // wanted: a handful of files reads better flat, and thirty across five directories is
+    // unreadable that way. Not persisted — a view preference is not worth a stored key.
+    tree: false,
     // Filled in by the GitHub half when it has something. Never blocks the panel.
     remoteInfo: null
 };
@@ -179,16 +183,46 @@ function remoteRows() {
     return rows;
 }
 
+// The name on the first line, the folder it is in on the second.
+//
+// The whole path in the title is what the panel truncates through the middle, and a
+// repository whose interesting files are five directories deep then renders twenty rows
+// that all read "AI Minute/Source/Core/Recordin…" and cannot be told apart. The name is
+// the part being looked for; the folder is what disambiguates two files sharing one.
 function fileRows(files, staging) {
     return files.map(function (file) {
+        var cut = file.path.lastIndexOf("/");
         return {
             id: (staging ? "diff:staged:" : "diff:worktree:") + file.path,
-            title: file.path,
+            title: cut === -1 ? file.path : file.path.slice(cut + 1),
+            detail: cut === -1 ? null : file.path.slice(0, cut),
             symbol: symbolFor(file, staging),
-            badge: badge(file, staging),
-            detail: state.selected === file.path ? "selected" : null
+            badge: badge(file, staging)
         };
     });
+}
+
+// One section of files, drawn whichever way the toggle is set.
+//
+// The tree is the host's: it is handed the paths and does the folding, the folders-first
+// ordering and the collapsing itself. A tree item carries only a path and a badge, so the
+// status symbol is dropped in that mode — the badge letter still says what changed.
+function fileNode(files, staging) {
+    if (state.tree) {
+        return {
+            type: "tree",
+            items: files.map(function (file) {
+                return { path: file.path, badge: badge(file, staging) };
+            })
+        };
+    }
+    return { type: "rows", rows: fileRows(files, staging) };
+}
+
+function viewToggleRow() {
+    return state.tree
+        ? { id: "action:view", title: "View as list", symbol: "list.bullet" }
+        : { id: "action:view", title: "View as tree", symbol: "list.bullet.indent" };
 }
 
 // The actions for whichever file is selected. Rows of their own, because a row has one
@@ -245,16 +279,22 @@ function panelNodes() {
     var stagedFiles = repo.staged;
     var unstagedFiles = repo.unstaged;
 
+    // One toggle above both sections: staged and unstaged are two views of one tree, and
+    // reading them differently from each other helps nobody.
+    if (stagedFiles.length || unstagedFiles.length) {
+        nodes.push({ type: "rows", rows: [viewToggleRow()] });
+    }
+
     if (stagedFiles.length) {
         nodes.push({ type: "heading", text: "Staged · " + stagedFiles.length });
-        nodes.push({ type: "rows", rows: fileRows(stagedFiles, true) });
+        nodes.push(fileNode(stagedFiles, true));
         nodes.push({ type: "rows", rows: [{ id: "action:unstageAll", title: "Unstage everything",
                                             symbol: "minus.square" }] });
     }
 
     if (unstagedFiles.length) {
         nodes.push({ type: "heading", text: "Changes · " + unstagedFiles.length });
-        nodes.push({ type: "rows", rows: fileRows(unstagedFiles, false) });
+        nodes.push(fileNode(unstagedFiles, false));
         nodes.push({ type: "rows", rows: [{ id: "action:stageAll", title: "Stage everything",
                                             symbol: "plus.square" }] });
     }
@@ -365,6 +405,7 @@ async function handle(id) {
 
     if (kind === "action") {
         if (rest === "refresh") { linelark.refreshPanels(); return; }
+        if (rest === "view") { state.tree = !state.tree; linelark.refreshPanels(); return; }
         if (rest === "fetch") { await perform("Fetch", function () { return linelark.repoFetchAsync(); }); return; }
         if (rest === "pull") { await perform("Pull", function () { return linelark.repoPullAsync(); }); return; }
         if (rest === "push") { await perform("Push", function () { return linelark.repoPushAsync(); }); return; }
@@ -417,7 +458,16 @@ async function handle(id) {
         openPullRequest(rest);
         return;
     }
-    // Anything else is a path in the tree, which means open it.
+    // Anything else is a path the tree sent: its items are files, not rows with ids of our
+    // making. A changed file gets the same click as its row would — the diff — and working
+    // out staged from unstaged is ours to do, since the path alone does not say.
+    var tracked = fileOf(id);
+    if (tracked) {
+        state.selected = id;
+        linelark.refreshPanels();
+        await showDiff(id, !!(tracked.staged && !tracked.unstaged));
+        return;
+    }
     linelark.openFile(id);
 }
 
