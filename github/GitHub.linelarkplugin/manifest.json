@@ -2,7 +2,7 @@
   "id": "com.linelark.example.github",
   "name": "GitHub",
   "version": "2.0.0",
-  "apiVersion": 1,
+  "apiVersion": 2,
   "main": "main.js",
   "author": "Linelark",
   "description": "A git client in the side panel: stage, commit, pull, push, and read diffs — plus pull requests and checks from github.com.",

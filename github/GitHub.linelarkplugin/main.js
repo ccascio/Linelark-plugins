@@ -34,10 +34,45 @@ var state = {
     // Flat names with their folder underneath, or the folder structure itself. Both are
     // wanted: a handful of files reads better flat, and thirty across five directories is
     // unreadable that way. Not persisted — a view preference is not worth a stored key.
-    tree: false,
+    tree: true,
+    // Whether this session has seen a commit go through, which is what stops the numbering
+    // being furniture. "Step 1" is for somebody who does not yet know that staging gates
+    // committing; once they have committed once, they know, and two numbers that never go
+    // away are noise on the five-hundredth commit.
+    //
+    // In memory rather than stored: there is no key-value store in the plugin API, and
+    // adding one to the host to hide two words would be the wrong trade. The numbers come
+    // back after a restart, for one commit.
+    committed: false,
     // Filled in by the GitHub half when it has something. Never blocks the panel.
     remoteInfo: null
 };
+
+// A successful outcome clears itself; a failure does not.
+//
+// "Push finished." is worth a few seconds and no more. git explaining *why* a push was
+// rejected is the entire reason the panel said anything at all, and putting that on a timer
+// would throw away the only copy of it — there is no scrollback in a sidebar.
+var outcomeTimer = null;
+
+function clearOutcome() {
+    if (outcomeTimer !== null) {
+        clearTimeout(outcomeTimer);
+        outcomeTimer = null;
+    }
+    state.outcome = null;
+}
+
+function showOutcome(ok, text) {
+    clearOutcome();
+    state.outcome = { ok: ok, text: text };
+    if (!ok) { return; }
+    outcomeTimer = setTimeout(function () {
+        outcomeTimer = null;
+        state.outcome = null;
+        linelark.refreshPanels();
+    }, 4000);
+}
 
 // MARK: - Running a write
 
@@ -48,21 +83,19 @@ async function perform(label, work) {
         return null;
     }
     state.busy = label;
-    state.outcome = null;
+    clearOutcome();
     invalidate();
     linelark.refreshPanels();
     var result = null;
     try {
         result = await work();
-        state.outcome = {
-            ok: result.ok,
-            // git is quiet on success — `--quiet` is passed precisely so a panel is not
-            // filled with progress — so say something when it says nothing.
-            text: result.output || (result.ok ? label + " finished." : label + " failed.")
-        };
+        showOutcome(result.ok,
+                    // git is quiet on success — `--quiet` is passed precisely so a panel is
+                    // not filled with progress — so say something when it says nothing.
+                    result.output || (result.ok ? label + " finished." : label + " failed."));
     } catch (error) {
         // A refusal from the host arrives here: no consent, no repository, wrong edition.
-        state.outcome = { ok: false, text: String(error && error.message ? error.message : error) };
+        showOutcome(false, String(error && error.message ? error.message : error));
     }
     state.busy = null;
     invalidate();
@@ -122,6 +155,17 @@ function badge(file, staging) {
     return column || null;
 }
 
+// Modified is a warning, added is positive, deleted is negative, and a file git has never
+// seen is none of those — it is information. Left alone the host draws every badge the same
+// grey, and a column of identical grey letters is a column nobody reads.
+function badgeTint(file, staging) {
+    var column = staging ? file.index : file.worktree;
+    if (column === "?") { return "info"; }
+    if (column === "A") { return "positive"; }
+    if (column === "D") { return "negative"; }
+    if (column === "R") { return "info"; }
+    return "warning";
+}
 function symbolFor(file, staging) {
     var column = staging ? file.index : file.worktree;
     if (column === "?") { return "plus.circle"; }
@@ -160,27 +204,33 @@ function branchRow() {
 // Fetch, pull and push, each saying what it would actually do. A button labelled "Pull"
 // beside a branch that is level is a button that does nothing, and one labelled "Pull (2)"
 // is a reason to press it.
-function remoteRows() {
-    var tracking = repository().tracking;
-    var rows = [];
+// Icons on one line rather than a stack of rows. The titles still say what each will
+// actually do — "Pull 2 behind", "Push and set upstream" — they say it on hover now, which
+// is the trade: several lines of the sidebar back, at the cost of having to point at one.
+function remoteActions() {
     if (state.busy) {
-        rows.push({ id: "noop", title: state.busy + "…", symbol: "clock" });
-        return rows;
+        return { type: "rows", rows: [{ id: "noop", title: state.busy + "…", symbol: "clock" }] };
     }
-    rows.push({ id: "action:fetch", title: "Fetch", symbol: "arrow.down.circle" });
-    rows.push({
-        id: "action:pull",
-        title: tracking && tracking.behind ? "Pull " + tracking.behind + " behind" : "Pull",
-        symbol: "arrow.down.to.line"
-    });
-    rows.push({
-        id: "action:push",
-        title: tracking
-            ? (tracking.ahead ? "Push " + tracking.ahead + " ahead" : "Push")
-            : "Push and set upstream",
-        symbol: "arrow.up.to.line"
-    });
-    return rows;
+    var tracking = repository().tracking;
+    return {
+        type: "actions",
+        actions: [
+            { id: "action:fetch", title: "Fetch", symbol: "arrow.down.circle" },
+            { id: "action:pull",
+              title: tracking && tracking.behind
+                  ? "Pull " + tracking.behind + " behind" : "Pull",
+              symbol: "arrow.down.to.line" },
+            { id: "action:push",
+              title: tracking
+                  ? (tracking.ahead ? "Push " + tracking.ahead + " ahead" : "Push")
+                  : "Push and set upstream",
+              symbol: "arrow.up.to.line" },
+            { id: "action:view",
+              title: state.tree ? "View as list" : "View as tree",
+              symbol: state.tree ? "list.bullet" : "list.bullet.indent" },
+            { id: "action:refresh", title: "Refresh", symbol: "arrow.clockwise" }
+        ]
+    };
 }
 
 // The name on the first line, the folder it is in on the second.
@@ -197,7 +247,8 @@ function fileRows(files, staging) {
             title: cut === -1 ? file.path : file.path.slice(cut + 1),
             detail: cut === -1 ? null : file.path.slice(0, cut),
             symbol: symbolFor(file, staging),
-            badge: badge(file, staging)
+            badge: badge(file, staging),
+            badgeTint: badgeTint(file, staging)
         };
     });
 }
@@ -207,45 +258,87 @@ function fileRows(files, staging) {
 // The tree is the host's: it is handed the paths and does the folding, the folders-first
 // ordering and the collapsing itself. A tree item carries only a path and a badge, so the
 // status symbol is dropped in that mode — the badge letter still says what changed.
-function fileNode(files, staging) {
+// Returns a *list* of nodes, because the selected file's actions go directly beneath it:
+// the rows down to the selection, the actions, then the rest. Scrolling past thirty files
+// to reach the one button that applies to the file you just clicked is not a panel.
+//
+// A tree cannot be split that way — it is a single node and the host builds the folders
+// from the paths it is handed — so there the actions follow the whole tree instead.
+function fileNodes(files, staging) {
     if (state.tree) {
-        return {
+        var nodes = [{
             type: "tree",
             items: files.map(function (file) {
-                return { path: file.path, badge: badge(file, staging) };
+                return { path: file.path, badge: badge(file, staging),
+                         badgeTint: badgeTint(file, staging) };
             })
-        };
+        }];
+        if (indexOfSelected(files) !== -1) { nodes.push(selectionActions()); }
+        return nodes;
     }
-    return { type: "rows", rows: fileRows(files, staging) };
+
+    var rows = fileRows(files, staging);
+    var at = indexOfSelected(files);
+    if (at === -1) { return [{ type: "rows", rows: rows }]; }
+
+    var out = [{ type: "rows", rows: rows.slice(0, at + 1) }, selectionActions()];
+    if (at + 1 < rows.length) { out.push({ type: "rows", rows: rows.slice(at + 1) }); }
+    return out;
 }
 
-function viewToggleRow() {
-    return state.tree
-        ? { id: "action:view", title: "View as list", symbol: "list.bullet" }
-        : { id: "action:view", title: "View as tree", symbol: "list.bullet.indent" };
+function indexOfSelected(files) {
+    for (var i = 0; i < files.length; i++) {
+        if (files[i].path === state.selected) { return i; }
+    }
+    return -1;
 }
 
-// The actions for whichever file is selected. Rows of their own, because a row has one
-// click and it is already spent on showing the diff.
-function selectionRows() {
-    if (!state.selected) { return []; }
-    var file = fileOf(state.selected);
+// A foldable group, as an array so it concatenates like every other run of nodes here and
+// disappears entirely when there is nothing to put in it.
+//
+// The panel is long: a repository with thirty changed files pushed Branches, GitHub and the
+// history graph so far down that nobody scrolled to them. Folding is what gives the reader
+// somewhere to put the part they are not looking at.
+// A title, numbered only while the numbering is still teaching something.
+function step(number, title) {
+    return state.committed ? title : "Step " + number + " · " + title;
+}
+
+function section(id, title, collapsed, children) {
+    if (!children.length) { return []; }
+    return [{ type: "section", id: id, title: title, collapsed: collapsed, children: children }];
+}
+
+// What can be done to the selected file, as icons under it. Separate from the file's own
+// row because a row has one click and it is already spent on showing the diff.
+//
+// An empty `rows` node is the "nothing here" answer: the host drops it, which is what makes
+// this safe to insert unconditionally.
+function selectionActions() {
+    var file = state.selected ? fileOf(state.selected) : null;
     if (!file) {
         state.selected = null;
-        return [];
+        return { type: "rows", rows: [] };
     }
     var name = state.selected.split("/").pop();
-    var rows = [];
+    var actions = [];
     if (file.unstaged || file.untracked) {
-        rows.push({ id: "stage:" + state.selected, title: "Stage " + name,
-                    symbol: "plus.square" });
+        actions.push({ id: "stage:" + state.selected, title: "Stage " + name,
+                       symbol: "plus.square" });
     }
     if (file.staged) {
-        rows.push({ id: "unstage:" + state.selected, title: "Unstage " + name,
-                    symbol: "minus.square" });
+        actions.push({ id: "unstage:" + state.selected, title: "Unstage " + name,
+                       symbol: "minus.square" });
     }
-    rows.push({ id: "open:" + state.selected, title: "Open " + name, symbol: "doc.text" });
-    return rows;
+    actions.push({ id: "open:" + state.selected, title: "Open " + name, symbol: "doc.text" });
+    // Only where there is something to restore *to*. An untracked file has no index entry,
+    // so discarding it would mean deleting it, and this API cannot delete a file.
+    if (file.unstaged && !file.untracked) {
+        actions.push({ id: "discard:" + state.selected,
+                       title: "Discard changes to " + name,
+                       symbol: "arrow.uturn.backward", tint: "negative" });
+    }
+    return { type: "actions", actions: actions };
 }
 
 // MARK: - The panel
@@ -267,7 +360,7 @@ function panelNodes() {
     }
 
     var nodes = [{ type: "rows", rows: [branchRow()] }];
-    nodes.push({ type: "rows", rows: remoteRows() });
+    nodes.push(remoteActions());
 
     if (state.outcome) {
         nodes.push({ type: "heading", text: state.outcome.ok ? "Done" : "git said" });
@@ -279,24 +372,25 @@ function panelNodes() {
     var stagedFiles = repo.staged;
     var unstagedFiles = repo.unstaged;
 
-    // One toggle above both sections: staged and unstaged are two views of one tree, and
-    // reading them differently from each other helps nobody.
-    if (stagedFiles.length || unstagedFiles.length) {
-        nodes.push({ type: "rows", rows: [viewToggleRow()] });
-    }
-
+    // Open, both of them: what has changed is why the panel was opened.
     if (stagedFiles.length) {
-        nodes.push({ type: "heading", text: "Staged · " + stagedFiles.length });
-        nodes.push(fileNode(stagedFiles, true));
-        nodes.push({ type: "rows", rows: [{ id: "action:unstageAll", title: "Unstage everything",
-                                            symbol: "minus.square" }] });
+        nodes = nodes.concat(section("staged", "Staged · " + stagedFiles.length, false,
+            fileNodes(stagedFiles, true).concat([
+                { type: "button", id: "action:unstageAll", title: "Unstage everything",
+                  symbol: "minus.square" }
+            ])));
     }
 
     if (unstagedFiles.length) {
-        nodes.push({ type: "heading", text: "Changes · " + unstagedFiles.length });
-        nodes.push(fileNode(unstagedFiles, false));
-        nodes.push({ type: "rows", rows: [{ id: "action:stageAll", title: "Stage everything",
-                                            symbol: "plus.square" }] });
+        nodes = nodes.concat(section("changes", "Changes · " + unstagedFiles.length, false,
+            fileNodes(unstagedFiles, false).concat([
+                // Filled only while nothing is staged, because that is the one moment it is
+                // the obvious next thing to press. Once something is staged the obvious next
+                // thing is Commit, and two filled buttons would argue with each other.
+                { type: "button", id: "action:stageAll",
+                  title: step(1, "Stage everything"),
+                  symbol: "plus.square", prominent: stagedFiles.length === 0 }
+            ])));
     }
 
     if (!stagedFiles.length && !unstagedFiles.length) {
@@ -304,48 +398,48 @@ function panelNodes() {
                                             symbol: "checkmark.circle" }] });
     }
 
-    var selection = selectionRows();
-    if (selection.length) {
-        nodes.push({ type: "heading", text: "Selected file" });
-        nodes.push({ type: "rows", rows: selection });
-    }
-
     // Only offered when it could work. A commit box on a plugin the user has not allowed to
     // write is a box that throws when you press the button.
-    if (repo.canWrite) {
-        nodes.push({ type: "heading", text: "Commit" });
+    if (repo.canWrite && stagedFiles.length) {
+        nodes.push({ type: "heading", text: step(2, "Commit") });
+        // The box exists only when there is something to commit, the same way there is no
+        // Stage button with nothing to stage. A box that cannot be used teaches nobody what
+        // would make it usable — it just looks broken — and the step above it says what to
+        // press instead. The label counts what the commit will actually include, and says
+        // it in the one place that does not vanish as soon as somebody types.
         nodes.push({
             type: "field", id: "commit",
-            placeholder: stagedFiles.length
-                ? "Message for " + stagedFiles.length + " staged file"
-                    + (stagedFiles.length === 1 ? "" : "s")
-                : "Stage something first",
+            label: stagedFiles.length + " staged file"
+                + (stagedFiles.length === 1 ? "" : "s"),
+            placeholder: "Message",
             value: state.message,
             multiline: true,
             submit: "Commit",
-            enabled: stagedFiles.length > 0 && !state.busy
+            enabled: !state.busy
         });
-    } else {
+    } else if (!repo.canWrite) {
         nodes.push({ type: "heading", text: "Read-only" });
         nodes.push({ type: "text",
                      text: "Allow “Changes to git” for this plugin in Plugins ▸ Manage "
                          + "Plugins to stage, commit, pull and push from here." });
     }
 
-    nodes = nodes.concat(branchNodes());
-    nodes = nodes.concat(remoteInfoNodes());
-
-    if (repo.commits.length) {
-        nodes.push({ type: "heading", text: "History" });
-        nodes.push({ type: "graph", commits: repo.commits });
-    }
+    // Shut to begin with. All three are reference rather than the task in hand, and the
+    // panel is read top-down: a branch list between the commit box and the history is what
+    // made the graph unreachable without scrolling past everything else.
+    nodes = nodes.concat(section("branches", "Branches", true, branchNodes()));
+    nodes = nodes.concat(section("github", githubTitle(), true, remoteInfoNodes()));
+    nodes = nodes.concat(section("history", "History", true,
+                                 repo.commits.length
+                                     ? [{ type: "graph", commits: repo.commits }]
+                                     : []));
     return nodes;
 }
 
 function branchNodes() {
     var branches = repository().branches;
     if (branches.length < 1) { return []; }
-    var nodes = [{ type: "heading", text: "Branches" }];
+    var nodes = [];
     nodes.push({
         type: "rows",
         rows: branches.map(function (branch) {
@@ -383,13 +477,15 @@ async function showDiff(path, isStaged) {
         linelark.openFile(path);
         return;
     }
-    linelark.openVirtual({
+    // `openDiff` rather than `openVirtual`: the editor draws the patch as the two files it
+    // describes, side by side, instead of showing the patch itself. What is handed over is
+    // the same string either way — git's own answer, which is the only thing that knows how
+    // to compare a staged change against the index.
+    linelark.openDiff({
         key: "diff:" + (isStaged ? "staged:" : "worktree:") + path,
         name: path.split("/").pop() + ".diff",
         label: isStaged ? "staged" : "changes",
-        text: diff,
-        // The editor already knows how to colour a unified diff, so this costs one word.
-        language: "diff"
+        patch: diff
     });
 }
 
@@ -438,6 +534,12 @@ async function handle(id) {
     }
     if (kind === "stage") {
         await perform("Stage", function () { return linelark.repoStageAsync([rest]); });
+        return;
+    }
+    if (kind === "discard") {
+        // The host asks before it does this; a refusal comes back as an ordinary failed
+        // outcome, so "Cancelled." lands in the same place git's own words would.
+        await perform("Discard", function () { return linelark.repoDiscardAsync([rest]); });
         return;
     }
     if (kind === "unstage") {
@@ -501,6 +603,7 @@ linelark.addPanel({
             if (result && result.ok) {
                 state.message = "";
                 state.selected = null;
+                state.committed = true;
                 linelark.refreshPanels();
             }
             return;
@@ -620,11 +723,17 @@ async function api(path) {
     return JSON.parse(response.body);
 }
 
+// The section's title, which is where the repository's name now lives.
+function githubTitle() {
+    var slug = githubSlug();
+    return slug ? "github.com/" + slug.owner + "/" + slug.repo : "GitHub";
+}
+
 function remoteInfoNodes() {
     var slug = githubSlug();
     if (!slug) { return []; }
 
-    var nodes = [{ type: "heading", text: "github.com/" + slug.owner + "/" + slug.repo }];
+    var nodes = [];
     if (!linelark.canReachNetwork()) {
         nodes.push({
             type: "text",

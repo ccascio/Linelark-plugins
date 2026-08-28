@@ -44,6 +44,13 @@ and any error that escaped, including one thrown after an `await`.
 
 `id` and `name` are required; everything else has a default. `main` defaults to `main.js`.
 
+**`apiVersion` is load-bearing.** It is the generation of the host API the plugin was
+written against, and a host that speaks an older one refuses to load it, saying so. That
+matters because an unknown node type is *skipped* rather than fatal — which is right, but
+means a plugin using a newer node on an older host silently loses whole sections of its
+panel instead of failing. Generation 2 covers `section`, `actions` and `button` nodes,
+`badgeTint`, `openDiff` and `repoDiscardAsync`; a plugin using any of them must say `2`.
+
 ```json
 {
   "id": "com.example.thing",
@@ -77,7 +84,8 @@ Document      fileName() · filePath() · language() · isReadOnly()
 Reading       text() · length() · lineCount() · line(n) · getRange(loc, len)
 Selection     selection() · selectionRange() · setSelection(loc, len)
 Writing       replaceSelection(s) · replaceRange(loc, len, s) · setText(s) · insert(s)
-Opening       openFile(path) · openVirtual({key, name, text, label, language}) · folderRoot()
+Opening       openFile(path) · openVirtual({key, name, text, label, language})
+              openDiff({key, name, patch, label}) · folderRoot()
 Scheduling    setTimeout · setInterval · clearTimeout · clearInterval · queueMicrotask
 Network       fetch({url, method, headers, body, timeout}) · canReachNetwork() · hasSecret(name)
 Git read      repoIsAvailable() · repoRoot() · repoHead() · repoLog(n) · repoFiles() · repoShow(path)
@@ -85,6 +93,7 @@ Git read      repoIsAvailable() · repoRoot() · repoHead() · repoLog(n) · rep
               repoLogAsync(n) · repoFilesAsync() · repoShowAsync(path)
               repoDiffAsync({path, staged, untracked})
 Git write     repoCanWrite() · repoStageAsync(paths) · repoUnstageAsync(paths)
+ (asks first) repoDiscardAsync(paths)
  (Studio,     repoCommitAsync(message) · repoFetchAsync() · repoPullAsync() · repoPushAsync()
   granted)    repoSwitchAsync(branch) · repoCreateBranchAsync(branch)
 ```
@@ -95,11 +104,39 @@ Panel descriptor: `{id, title, symbol, side, render, onSelect, onSubmit}`. `symb
 ```js
 { type: "heading", text }
 { type: "text",    text, style: "primary" }   // secondary unless you say otherwise
-{ type: "rows",    rows:  [{ id, title, detail, symbol, badge }] }
-{ type: "tree",    items: [{ path: "a/b/c.swift", badge }] }
+{ type: "rows",    rows:  [{ id, title, detail, symbol, badge, badgeTint }] }
+{ type: "tree",    items: [{ path: "a/b/c.swift", badge, badgeTint }] }
+{ type: "actions", actions: [{ id, title, symbol, enabled, tint }] }
+{ type: "button",  id, title, symbol, prominent, enabled }
 { type: "graph",   commits: [{ sha, parents, subject, author, date, refs }] }
 { type: "field",   id, label, placeholder, value, multiline, submit, enabled }
+{ type: "section", id, title, collapsed, children: [nodes] }
 ```
+
+`button` is a labelled button drawn as one, full width. `rows` looks like a list and
+`actions` like a strip of icons, and neither reads as *press this* — which matters most
+where one step gates another. A greyed-out Commit says nothing about the row above it that
+would ungrey it, and a user who does not already know git's staging model cannot find that
+out by looking. `prominent` fills it; use it for the single obvious next step and never for
+two at once.
+
+`actions` is a row of icons, each naming itself in a tooltip — a sidebar runs out of
+vertical room long before it runs out of things to offer, and four stacked rows reading
+Fetch, Pull, Push and Refresh are four lines that could be four icons on one. `title` is not
+optional: it is the tooltip *and* what VoiceOver reads, so an action without one is refused,
+as is one with no `symbol`.
+
+`badgeTint` and an action's `tint` name a *meaning* — `neutral`, `positive`, `warning`,
+`negative`, `info` — never a colour. The theme owns the palette; a plugin that could name a
+colour would eventually name one nobody can see against their background. A tint this build
+does not recognise reads as none at all rather than failing the node.
+
+A `section` is the one node that contains others, and the only way to give a long panel
+structure a reader can close. Like `field`, the plugin supplies the *opening* position and
+the view owns it afterwards — `collapsed` is how the section starts, not what it is, so a
+redraw does not reopen one somebody just shut. That makes `id` load-bearing: it is what the
+panel remembers the state against, so it has to be stable across draws. Sections nest three
+deep; a fourth is refused. An empty one is skipped, exactly as an empty `rows` is.
 
 A `field` is the one node that sends something back: `onSubmit(id, value)`. The plugin
 supplies the *initial* value and the view owns what is typed after that, so a redraw does not
@@ -133,6 +170,14 @@ across the switch. `-1` means "could not place this", and such a block is never 
 — which is what nested blocks use, since a blockquote's children are lexed from text its
 markers were stripped out of.
 
+`openDiff` takes a unified diff — git's own output, as `repoDiffAsync` returns it — and
+draws it as the two files it describes, side by side. A patch rather than two texts because
+that is what a plugin can get: comparing a *staged* change means comparing against the
+index, and no call here returns that blob. The tab is read-only, and it shows the hunks and
+their context rather than the whole file, with a gap row marking each stretch git did not
+send. It is otherwise a virtual buffer — same key-based tab reuse, same lifetime — so a
+`key` already used by `openVirtual` opens a second tab rather than replacing the first.
+
 `fetch` resolves to `{status, ok, headers, body, isText}`.
 
 ## Rules that bite
@@ -163,9 +208,18 @@ markers were stripped out of.
 - **Studio-only:** git and network. `repoIsAvailable()`, `repoCanWrite()` and
   `canReachNetwork()` answer `false` in the sandboxed App Store edition — check and explain,
   or the panel reads as broken.
-- **Nothing can force, reset, discard or merge.** Not "do not do this" — there is no call for
-  it. `repoPullAsync` is `--ff-only` and a diverged push is rejected by git. Report what
+- **Nothing can force, reset or merge.** Not "do not do this" — there is no call for it.
+  `repoPullAsync` is `--ff-only` and a diverged push is rejected by git. Report what
   `output` says and leave the rest to the terminal.
+- **`repoDiscardAsync` is the one call that can lose work, and the only one that asks.**
+  It restores the named files from the index, so a change deliberately staged survives and
+  only the edits on top of it go. Untracked files are refused: git restores *from* the
+  index, and a file it has never seen has nothing there — discarding one would mean
+  deleting it, which is `clean` by another name and still absent. The host puts the
+  question on screen itself, in front of the call, because a plugin cannot show a dialog
+  and a plugin that could would be the wrong thing to trust with this one. A refusal comes
+  back as an ordinary `{ok: false, output: "Cancelled."}` rather than a rejection: the user
+  declining is not an error for a plugin to report as one.
 - **A write is refused, not queued, when permission is missing.** Both gates are checked at
   the moment of the call, so a permission taken away stops the next commit. The rejection is
   a `catch`, with a message naming what to switch on.

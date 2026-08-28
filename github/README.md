@@ -92,4 +92,6 @@ The history graph is capped at 120 commits, and the check-run roll-up describes 
 `repoUnstageAsync`, `repoCommitAsync`, `repoFetchAsync`, `repoPullAsync`, `repoPushAsync`,
 `repoSwitchAsync`, `repoCreateBranchAsync`.
 
-Panel nodes: `rows`, `tree`, `heading`, `text`, `graph`, `field`.
+Panel nodes: `rows`, `tree`, `section`, `actions`, `button`, `heading`, `text`, `graph`, `field`.
+Opening: `openFile`, `openDiff` — a clicked file's patch is drawn side by side.
+Git write: adds `repoDiscardAsync`, which the host confirms before running.
