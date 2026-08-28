@@ -1,7 +1,7 @@
 {
   "id": "com.linelark.example.github",
   "name": "GitHub",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "apiVersion": 2,
   "main": "main.js",
   "author": "Linelark",
