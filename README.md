@@ -16,10 +16,12 @@ release of the editor.
 
 | Plugin | Shows |
 | --- | --- |
-| [`sort-lines`](sort-lines/) | Editing: expand a selection to whole lines, compute the result, apply it as one undoable edit |
+| [`sort-lines`](sort-lines/) | Editing: expand a selection to whole lines, compute the result, apply it as one undoable edit — and a panel that is a form, built out of rows because there is no checkbox node, and gated on nothing the panel cannot watch change |
 | [`document-preview`](document-preview/) | Rendering: Markdown and HTML drawn in place of their source, two previews from one plugin, each block carrying the offset it came from so the switch keeps your place |
 | [`github`](github/) | A git client: stage, commit, pull, push, diffs of what has changed, branches, and pull requests from the API. The one that asks for permissions, and the one to read for what a real panel looks like |
-| [`scratch-notes`](scratch-notes/) | A right-dock panel that reads the front file and moves the caret when a row is clicked |
+| [`scratch-notes`](scratch-notes/) | Keeping something: notes pinned to a line, saved as you type, and a panel that redraws when the caret moves — the one case `followsCaret` exists for |
+| [`compare-files`](compare-files/) | Comparing and merging: a patience diff computed in JavaScript, drawn by `openDiff` with merge arrows down the middle, and a write back into either file |
+| [`story-bible`](story-bible/) | Sections as tabs, several autosaving boxes at once, and what a plugin owes a box it rewrites while somebody is typing into it |
 
 Each folder holds a `README.md` and the `.linelarkplugin` bundle itself. The bundle is what
 gets installed; the folder around it is where the plugin is documented.
@@ -50,7 +52,9 @@ timers and promises, and the limits worth knowing before designing around them �
 
 ## Requirements
 
-`apiVersion` 1. Git is Studio-only: the sandbox blocks subprocesses, so the App Store edition
+`apiVersion` 1 for most of these. `scratch-notes` and `story-bible` need 3 for the plugin
+store and autosaving fields; `compare-files` needs 4 for merge callbacks in `openDiff`.
+An older host refuses to load them and says so. Git is Studio-only: the sandbox blocks subprocesses, so the App Store edition
 does not ship the git reader at all and `repoIsAvailable()` answers `false` there. A plugin
 that uses it should check and explain itself rather than showing an empty panel.
 

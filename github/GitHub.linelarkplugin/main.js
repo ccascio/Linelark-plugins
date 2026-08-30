@@ -3,15 +3,15 @@
 // Everything here is local git. The panel shows what has changed, what is staged, what the
 // branch is against its remote, and lets you stage, commit, fetch, pull and push without
 // leaving the editor. The optional half at the bottom asks github.com about pull requests
-// and checks, and only if you give it a token.
+// and checks, and only once you have signed in — in your browser, through GitHub's device
+// flow, or by pasting a token by hand if you would rather.
 //
 // Three things shape the whole file.
 //
-// **The host does the dangerous part, and refuses most of it.** There is no force push, no
-// reset, no discard and no merge in the API at all, and `pull` is fast-forward only — so
-// nothing this plugin can do will destroy committed work or overwrite somebody else's. That
-// is a property of Linelark, not of this code being careful, which is the only kind of
-// safety worth relying on.
+// **The host does the dangerous part, and refuses most of it.** There is no force push,
+// reset or merge in the API at all, and `pull` is fast-forward only. Discarding edits and
+// removing a remote are confirmed by Linelark itself. That is a property of Linelark, not
+// of this code being careful, which is the only kind of safety worth relying on.
 //
 // **A panel has one click per row.** So clicking a changed file *selects* it and shows its
 // diff, and the actions for that file appear as their own rows underneath. Trying to fit
@@ -31,6 +31,9 @@ var state = {
     outcome: null,
     message: "",
     branch: "",
+    remoteEntry: "",
+    selectedRemote: null,
+    remoteURL: "",
     // Flat names with their folder underneath, or the folder structure itself. Both are
     // wanted: a handful of files reads better flat, and thirty across five directories is
     // unreadable that way. Not persisted — a view preference is not worth a stored key.
@@ -45,7 +48,11 @@ var state = {
     // back after a restart, for one commit.
     committed: false,
     // Filled in by the GitHub half when it has something. Never blocks the panel.
-    remoteInfo: null
+    remoteInfo: null,
+    // A sign-in that is part-way through: the code GitHub gave us to show, or the reason
+    // the attempt ended. Null the rest of the time, which is nearly always. It is also the
+    // cancel flag — see `pollForToken`.
+    signIn: null
 };
 
 // A successful outcome clears itself; a failure does not.
@@ -211,26 +218,88 @@ function remoteActions() {
     if (state.busy) {
         return { type: "rows", rows: [{ id: "noop", title: state.busy + "…", symbol: "clock" }] };
     }
-    var tracking = repository().tracking;
+    var repo = repository();
+    var tracking = repo.tracking;
+    var hasRemote = repo.remotes.length > 0;
     return {
         type: "actions",
         actions: [
-            { id: "action:fetch", title: "Fetch", symbol: "arrow.down.circle" },
+            { id: "action:fetch", title: "Fetch", symbol: "arrow.down.circle",
+              enabled: repo.canWrite && hasRemote },
             { id: "action:pull",
               title: tracking && tracking.behind
                   ? "Pull " + tracking.behind + " behind" : "Pull",
-              symbol: "arrow.down.to.line" },
+              symbol: "arrow.down.to.line", enabled: repo.canWrite && hasRemote },
             { id: "action:push",
               title: tracking
                   ? (tracking.ahead ? "Push " + tracking.ahead + " ahead" : "Push")
                   : "Push and set upstream",
-              symbol: "arrow.up.to.line" },
+              symbol: "arrow.up.to.line", enabled: repo.canWrite && hasRemote },
             { id: "action:view",
               title: state.tree ? "View as list" : "View as tree",
               symbol: state.tree ? "list.bullet" : "list.bullet.indent" },
             { id: "action:refresh", title: "Refresh", symbol: "arrow.clockwise" }
         ]
     };
+}
+
+// Remotes are repository configuration, so they belong beside fetch/pull/push instead of
+// being hidden in a settings screen. Selecting one reveals its editable URL and remove
+// action. The host validates every argument and confirms removal itself.
+function remoteNodes() {
+    var repo = repository();
+    var remotes = repo.remotes;
+    var nodes = [];
+
+    if (remotes.length) {
+        nodes.push({
+            type: "rows",
+            rows: remotes.map(function (remote) {
+                return {
+                    id: "remote:" + remote.name,
+                    title: remote.name,
+                    detail: remote.url,
+                    symbol: state.selectedRemote === remote.name
+                        ? "checkmark.circle.fill" : "network"
+                };
+            })
+        });
+    } else {
+        nodes.push({ type: "text", text: "No remote is configured for this repository." });
+    }
+
+    if (state.selectedRemote) {
+        var selected = null;
+        remotes.forEach(function (remote) {
+            if (remote.name === state.selectedRemote) { selected = remote; }
+        });
+        if (selected) {
+            nodes.push({
+                type: "field", id: "remoteURL", label: "Change " + selected.name + " URL",
+                placeholder: "https://github.com/owner/repository.git",
+                value: state.remoteURL, multiline: false, submit: "Save URL",
+                enabled: repo.canWrite && !state.busy
+            });
+            nodes.push({
+                type: "button", id: "removeRemote:" + selected.name,
+                title: "Remove " + selected.name, symbol: "trash",
+                enabled: repo.canWrite && !state.busy
+            });
+        } else {
+            state.selectedRemote = null;
+            state.remoteURL = "";
+        }
+    }
+
+    if (repo.canWrite) {
+        nodes.push({
+            type: "field", id: "addRemote", label: "Add a remote",
+            placeholder: "origin https://github.com/owner/repository.git",
+            value: state.remoteEntry, multiline: false, submit: "Add",
+            enabled: !state.busy
+        });
+    }
+    return nodes;
 }
 
 // The name on the first line, the folder it is in on the second.
@@ -427,7 +496,11 @@ function panelNodes() {
     // Shut to begin with. All three are reference rather than the task in hand, and the
     // panel is read top-down: a branch list between the commit box and the history is what
     // made the graph unreachable without scrolling past everything else.
+    nodes = nodes.concat(section("remotes", "Remotes · " + repo.remotes.length, true,
+                                 remoteNodes()));
     nodes = nodes.concat(section("branches", "Branches", true, branchNodes()));
+    nodes = nodes.concat(section("account", "GitHub account", linelark.hasSecret("token"),
+                                 githubAccountNodes()));
     nodes = nodes.concat(section("github", githubTitle(), true, remoteInfoNodes()));
     nodes = nodes.concat(section("history", "History", true,
                                  repo.commits.length
@@ -513,12 +586,73 @@ async function handle(id) {
             return;
         }
         if (rest === "github") { await loadGitHub(); return; }
+        if (rest === "login") {
+            // Signed in already, so this button reads "Manage GitHub token…" and means it.
+            // Starting a device flow here would be a second sign-in nobody asked for.
+            if (linelark.hasSecret("token")) { linelark.openPluginSettings(); return; }
+            // No browser here. This click fetches the code and draws it; the button it
+            // turns into is what opens the page — see the note above `wait`.
+            await startSignIn();
+            return;
+        }
+        if (rest === "openDevicePage") {
+            var attempt = state.signIn;
+            if (!attempt || !attempt.code) { return; }
+            // Copied again rather than trusted to have survived: whatever else has been
+            // copied since, the code is on the clipboard at the moment the page opens.
+            linelark.copyToClipboard(attempt.code);
+            linelark.openURL(attempt.verificationURI);
+            return;
+        }
+        if (rest === "cancelSignIn") {
+            // Dropping the attempt object is the whole cancellation: the polling loop
+            // compares against it after every sleep and stops when it is no longer the one.
+            state.signIn = null;
+            linelark.refreshPanels();
+            return;
+        }
+        if (rest === "signOut") { signOut(); return; }
+        if (rest === "token") { linelark.openPluginSettings(); return; }
+        if (rest === "newToken") {
+            linelark.openURL("https://github.com/settings/personal-access-tokens/new");
+            return;
+        }
+        if (rest === "repository") {
+            var slug = githubSlug();
+            if (slug) {
+                linelark.openURL("https://github.com/" + slug.owner + "/" + slug.repo);
+            }
+            return;
+        }
         if (rest === "unstageAll") {
             var toUnstage = repository().staged.map(function (file) { return file.path; });
             if (toUnstage.length) {
                 await perform("Unstage", function () { return linelark.repoUnstageAsync(toUnstage); });
             }
             return;
+        }
+        return;
+    }
+
+    if (kind === "remote") {
+        var chosen = null;
+        repository().remotes.forEach(function (remote) {
+            if (remote.name === rest) { chosen = remote; }
+        });
+        if (chosen) {
+            state.selectedRemote = chosen.name;
+            state.remoteURL = chosen.url;
+            linelark.refreshPanels();
+        }
+        return;
+    }
+    if (kind === "removeRemote") {
+        var removed = await perform("Remove " + rest, function () {
+            return linelark.repoRemoveRemoteAsync(rest);
+        });
+        if (removed && removed.ok) {
+            state.selectedRemote = null;
+            state.remoteURL = "";
         }
         return;
     }
@@ -555,8 +689,6 @@ async function handle(id) {
         return;
     }
     if (kind === "pr") {
-        // A pull request's own page. Opened as a buffer rather than in a browser: a plugin
-        // has no way to open a URL, and this at least puts the thing in front of you.
         openPullRequest(rest);
         return;
     }
@@ -617,6 +749,37 @@ linelark.addPanel({
                 state.branch = "";
                 linelark.refreshPanels();
             }
+            return;
+        }
+        if (id === "addRemote") {
+            state.remoteEntry = value;
+            var match = /^\s*(\S+)\s+(.\S(?:.*\S)?)\s*$/.exec(value);
+            if (!match) {
+                showOutcome(false, "Enter a name and URL, for example: origin "
+                            + "https://github.com/owner/repository.git");
+                linelark.refreshPanels();
+                return;
+            }
+            var added = await perform("Add " + match[1], function () {
+                return linelark.repoAddRemoteAsync(match[1], match[2]);
+            });
+            if (added && added.ok) {
+                state.remoteEntry = "";
+                state.selectedRemote = match[1];
+                state.remoteURL = match[2];
+                linelark.refreshPanels();
+            }
+            return;
+        }
+        if (id === "remoteURL" && state.selectedRemote) {
+            state.remoteURL = value;
+            var changed = await perform("Change " + state.selectedRemote + " URL", function () {
+                return linelark.repoSetRemoteURLAsync(state.selectedRemote, value);
+            });
+            if (changed && changed.ok) {
+                state.remoteURL = value.trim();
+                linelark.refreshPanels();
+            }
         }
     }
 });
@@ -657,6 +820,29 @@ linelark.addCommand("push", "Push", async function () {
     await perform("Push", function () { return linelark.repoPushAsync(); });
 });
 
+linelark.addCommand("account", "GitHub Account…", function () {
+    linelark.openPluginSettings();
+});
+
+linelark.addCommand("signIn", "Sign In to GitHub…", async function () {
+    if (linelark.hasSecret("token")) {
+        linelark.openPluginSettings();
+        return;
+    }
+    // Ends with the code in the Repository panel, where the button that opens github.com
+    // is. A command cannot draw anything itself.
+    await startSignIn();
+});
+
+linelark.addCommand("openRepository", "Open Repository on GitHub", function () {
+    var slug = githubSlug();
+    if (!slug) {
+        linelark.log("No github.com remote is configured for this repository.");
+        return;
+    }
+    linelark.openURL("https://github.com/" + slug.owner + "/" + slug.repo);
+});
+
 // The front tab as git names it: relative to the work tree, which is not always the folder
 // that was opened.
 function currentRepositoryPath() {
@@ -684,6 +870,18 @@ function currentRepositoryPath() {
 // and the host attaches the value to requests bound for api.github.com.
 
 var GITHUB_API = "https://api.github.com";
+var GITHUB_WEB = "https://github.com";
+
+// This plugin's own OAuth app. A device-flow client id is public by construction — it names
+// the application on the consent screen and nothing more — which is why there is no secret
+// beside it and why one being here is not a leak. The flow is designed for exactly this
+// case: a program that can open a browser but cannot receive a redirect back.
+var CLIENT_ID = "Ov23li1VRpexHTDxwLsY";
+
+// `repo` is the narrowest scope that covers a private repository's pull requests and check
+// runs. GitHub has no read-only equivalent for OAuth apps, so this is the floor rather than
+// a convenience — and it is why signing in is offered rather than assumed.
+var SIGN_IN_SCOPE = "repo";
 
 // `git@github.com:owner/repo.git` and `https://github.com/owner/repo.git` are the same
 // repository written two ways, and a client that only understood one of them would work for
@@ -701,6 +899,287 @@ function githubSlug() {
     return null;
 }
 
+// MARK: - Signing in
+//
+// GitHub's device flow, which is the only browser sign-in a plugin can actually complete.
+// The usual OAuth dance ends with the browser redirecting to a URL the application is
+// listening on, and a plugin has nowhere for that to land: Linelark registers no URL scheme
+// and a plugin cannot open a socket. The device flow was made for that shape of program —
+// it asks GitHub for a short code, the user types it into a page in their own browser, and
+// the *plugin* polls until GitHub says it was approved. Nothing comes back to us but the
+// answer to a question we asked.
+//
+// **The code is on screen before the browser is.** Opening the page first and fetching the
+// code afterwards saves a click and was wrong: GitHub's page asks for the code immediately,
+// and by then the user is looking at a browser while the only copy of it appears in an
+// editor behind it. So the first click asks GitHub and draws the code, and opening the page
+// is its own button — which is a second user action, and therefore still allowed to call
+// `openURL`.
+//
+// The token that arrives at the end goes straight to `setSecret`, which files it in the
+// Keychain slot the manifest declares. It is never kept in `state`, never written to the
+// plugin store, and after `finishSignIn` returns no variable here refers to it: from then on
+// this code is in exactly the position it was in with a hand-pasted token — able to send it
+// by asking the host to, and unable to read it.
+
+function wait(seconds) {
+    return new Promise(function (resolve) {
+        setTimeout(resolve, Math.max(1, seconds) * 1000);
+    });
+}
+
+// The two device-flow endpoints are on github.com rather than the API host, which is the
+// only reason the manifest declares a second host. Both answer form-encoded by default;
+// `Accept` is what makes them answer JSON.
+async function deviceEndpoint(path, body) {
+    var response = await linelark.fetch({
+        url: GITHUB_WEB + path,
+        method: "POST",
+        headers: {
+            "Accept": "application/json",
+            "Content-Type": "application/x-www-form-urlencoded"
+        },
+        body: body
+    });
+    if (!response.ok) {
+        throw new Error("GitHub answered " + response.status + " to the sign-in request.");
+    }
+    return JSON.parse(response.body);
+}
+
+// GitHub's own words for the ways this ends, in ours. Anything unrecognised is passed
+// through rather than swallowed: a new error code should read as a new error, not as
+// silence.
+function signInFailure(answer) {
+    if (answer.error === "expired_token") {
+        return "That code expired before it was approved. Start again when you are ready.";
+    }
+    if (answer.error === "access_denied") {
+        return "Sign-in was declined on github.com.";
+    }
+    if (answer.error === "device_flow_disabled") {
+        return "This build's GitHub app does not have device flow switched on.";
+    }
+    return answer.error_description || answer.error || "GitHub refused the sign-in.";
+}
+
+// A verification URL is only usable if it is one of GitHub's own.
+function deviceURL(candidate) {
+    if (typeof candidate !== "string") { return null; }
+    return /^https:\/\/github\.com\//.test(candidate) ? candidate : null;
+}
+
+async function startSignIn() {
+    // An attempt that has not ended is still an attempt, even in the second before GitHub
+    // has answered with a code: without this a second click asks for a second device code
+    // and the first one is left to expire unwatched.
+    if (state.signIn && !state.signIn.error) { return; }
+    state.signIn = { status: "Asking GitHub for a code…" };
+    linelark.refreshPanels();
+
+    var answer;
+    try {
+        answer = await deviceEndpoint("/login/device/code",
+                                      "client_id=" + encodeURIComponent(CLIENT_ID)
+                                      + "&scope=" + encodeURIComponent(SIGN_IN_SCOPE));
+    } catch (error) {
+        state.signIn = { error: String(error && error.message ? error.message : error) };
+        linelark.refreshPanels();
+        return;
+    }
+    if (!answer.device_code || !answer.user_code) {
+        state.signIn = { error: signInFailure(answer) };
+        linelark.refreshPanels();
+        return;
+    }
+
+    // The attempt object is its own identity token. Everything below compares against
+    // `state.signIn` rather than trusting that it is still the one it started with, so a
+    // cancelled or restarted sign-in stops this loop instead of racing the next one.
+    var attempt = {
+        code: answer.user_code,
+        deviceCode: answer.device_code,
+        // Where to send the user. `verification_uri_complete` is the device-flow field that
+        // carries the code in the URL, so the page opens already filled in; GitHub does not
+        // send it today, and `verification_uri` is what actually arrives. Both are checked
+        // against github.com before being opened — a URL out of a response is still a URL
+        // this plugin did not write.
+        verificationURI: deviceURL(answer.verification_uri_complete)
+                      || deviceURL(answer.verification_uri)
+                      || GITHUB_WEB + "/login/device",
+        // GitHub's floor, and it says so in the response. Polling faster earns `slow_down`.
+        interval: answer.interval || 5,
+        expiresAt: Date.now() + (answer.expires_in || 900) * 1000,
+        status: "Waiting for you to approve it on github.com…"
+    };
+
+    state.signIn = attempt;
+    // On the clipboard as well as on screen: the code is what the user has to get into
+    // another application, and eight characters retyped from a sidebar is the one step of
+    // this that can go wrong for no reason.
+    linelark.copyToClipboard(attempt.code);
+    linelark.refreshPanels();
+    await pollForToken(attempt);
+}
+
+async function pollForToken(attempt) {
+    while (state.signIn === attempt) {
+        await wait(attempt.interval);
+        // Cancelled, or replaced by a newer attempt, while we were asleep.
+        if (state.signIn !== attempt) { return; }
+        if (Date.now() > attempt.expiresAt) {
+            state.signIn = { error: signInFailure({ error: "expired_token" }) };
+            linelark.refreshPanels();
+            return;
+        }
+
+        var answer;
+        try {
+            answer = await deviceEndpoint(
+                "/login/oauth/access_token",
+                "client_id=" + encodeURIComponent(CLIENT_ID)
+                + "&device_code=" + encodeURIComponent(attempt.deviceCode)
+                + "&grant_type=" + encodeURIComponent("urn:ietf:params:oauth:grant-type:device_code"));
+        } catch (error) {
+            state.signIn = { error: String(error && error.message ? error.message : error) };
+            linelark.refreshPanels();
+            return;
+        }
+        if (state.signIn !== attempt) { return; }
+
+        if (answer.access_token) {
+            finishSignIn(answer.access_token);
+            return;
+        }
+        // Not yet approved, which is the answer nearly every time round.
+        if (answer.error === "authorization_pending") { continue; }
+        // Asked for too often. GitHub sends the new floor with it; five more is the
+        // documented fallback when it does not.
+        if (answer.error === "slow_down") {
+            attempt.interval = answer.interval || (attempt.interval + 5);
+            continue;
+        }
+        state.signIn = { error: signInFailure(answer) };
+        linelark.refreshPanels();
+        return;
+    }
+}
+
+// The end of the flow, and the only place a token is ever in this plugin's hands.
+//
+// `setSecret` answers with a refusal or with nothing, the way `storeSet` does — so this
+// tests it for falsiness rather than against a value, and says what it was told when the
+// Keychain would not take it. A sign-in that silently failed to save would look exactly
+// like one that worked until the next request.
+function finishSignIn(token) {
+    var refusal = linelark.setSecret("token", token);
+    state.signIn = refusal ? { error: refusal } : null;
+    // Cleared so the next draw asks GitHub again as the signed-in user rather than showing
+    // what the anonymous request managed to see.
+    if (!refusal) { state.remoteInfo = null; }
+    showOutcome(!refusal, refusal || "Signed in to GitHub.");
+    linelark.refreshPanels();
+}
+
+function signOut() {
+    var refusal = linelark.clearSecret("token");
+    if (!refusal) {
+        state.signIn = null;
+        state.remoteInfo = null;
+    }
+    showOutcome(!refusal, refusal || "Signed out. The token is gone from your Keychain.");
+    linelark.refreshPanels();
+}
+
+// Four nodes, always, whatever is happening.
+//
+// A node's identity is its position in the list, so a section that grows a line when it has
+// something to say moves every node after it — and the commit box lives in this same panel.
+// The words change; the shape does not. That is why the status line is drawn even when it
+// is only restating the obvious, and why the icon strip is one node however many icons are
+// in it.
+function githubAccountNodes() {
+    var connected = linelark.hasSecret("token");
+    var pending = state.signIn;
+    var slug = githubSlug();
+
+    var summary;
+    if (pending && pending.code) {
+        summary = "Your code is " + pending.code + ", and it is on your clipboard. Open "
+                + "github.com below and paste it there to finish signing in. "
+                + pending.status;
+    } else if (pending && pending.error) {
+        summary = pending.error;
+    } else if (pending) {
+        summary = pending.status;
+    } else if (connected) {
+        summary = "Signed in for GitHub API requests. The token stays in your Keychain and "
+                + "is never exposed to this plugin.";
+    } else {
+        summary = "Public repositories work anonymously. Sign in for private repositories "
+                + "and a higher API limit.";
+    }
+    var nodes = [{ type: "text", text: summary }];
+
+    // One button, and it is whatever the single obvious next step is: open the page while a
+    // code is waiting to be typed into it, sign in when nobody is signed in, and the
+    // credential screen when somebody is — where a pasted token can be replaced by hand.
+    if (pending && pending.code) {
+        nodes.push({
+            type: "button", id: "action:openDevicePage",
+            title: "Open github.com/login/device",
+            symbol: "arrow.up.forward.square",
+            prominent: true
+        });
+    } else if (pending && !pending.error) {
+        nodes.push({
+            type: "button", id: "action:login",
+            title: "Asking GitHub for a code…",
+            symbol: "ellipsis",
+            enabled: false
+        });
+    } else {
+        nodes.push({
+            type: "button", id: "action:login",
+            title: connected ? "Manage GitHub token…" : "Sign in with your browser",
+            symbol: connected ? "checkmark.shield" : "person.crop.circle.badge.plus",
+            prominent: !connected
+        });
+    }
+
+    var actions = [];
+    if (pending && !pending.error) {
+        actions.push({ id: "action:cancelSignIn", title: "Cancel sign-in", symbol: "xmark" });
+    } else if (pending) {
+        // The attempt is over and its message is still on screen. Clearing it is what puts
+        // the ordinary choices back.
+        actions.push({ id: "action:cancelSignIn", title: "Dismiss", symbol: "xmark" });
+    } else if (connected) {
+        actions.push({ id: "action:signOut", title: "Sign out", symbol: "rectangle.portrait.and.arrow.right",
+                       tint: "warning" });
+    } else {
+        // The way in for anybody who would rather not sign an OAuth app in: a fine-grained
+        // personal access token, pasted into the credential field, works exactly as well.
+        actions.push({ id: "action:token", title: "Paste a token instead", symbol: "key" });
+        actions.push({ id: "action:newToken", title: "Create a token on GitHub",
+                       symbol: "plus.rectangle.on.rectangle" });
+    }
+    if (slug) {
+        actions.push({
+            id: "action:repository", title: "Open repository on GitHub",
+            symbol: "arrow.up.forward.square"
+        });
+    }
+    nodes.push({ type: "actions", actions: actions });
+
+    nodes.push({
+        type: "text",
+        text: "This signs in API features such as pull requests and checks. Git push and "
+            + "pull continue to use your normal git credential helper."
+    });
+    return nodes;
+}
+
 async function api(path) {
     var response = await linelark.fetch({
         url: GITHUB_API + path,
@@ -715,8 +1194,8 @@ async function api(path) {
         // 403 without a token is nearly always the anonymous rate limit, and saying so is
         // more use than the status number.
         if (response.status === 403 && !linelark.hasSecret("token")) {
-            throw new Error("GitHub refused the request. Without a token you get 60 an hour; "
-                            + "add one in Manage Plugins.");
+            throw new Error("GitHub refused the request. Signed out you get 60 an hour; "
+                            + "sign in under GitHub account for more.");
         }
         throw new Error("GitHub answered " + response.status + ".");
     }
@@ -830,38 +1309,13 @@ async function loadGitHub() {
     linelark.refreshPanels();
 }
 
-// A pull request as a Markdown buffer.
-//
-// A plugin cannot open a browser — there is no API for it — so the next best thing is the
-// description, in a tab, named `.md` so the Preview button lights up and the links in it
-// become clickable there.
+// The row goes to the actual review surface. `openURL` accepts only absolute http/https
+// links, and this one came from the GitHub API response retained in `state.pulls`.
 function openPullRequest(number) {
     var pull = null;
     (state.pulls || []).forEach(function (candidate) {
         if (String(candidate.number) === String(number)) { pull = candidate; }
     });
     if (!pull) { return; }
-    var lines = [
-        "# " + pull.title,
-        "",
-        "[#" + pull.number + " on GitHub](" + pull.html_url + ")",
-        "",
-        "| | |",
-        "| --- | --- |",
-        "| Author | " + (pull.user ? pull.user.login : "unknown") + " |",
-        "| Branch | `" + pull.head.ref + "` → `" + pull.base.ref + "` |",
-        "| State | " + (pull.draft ? "draft" : pull.state) + " |",
-        "| Updated | " + pull.updated_at + " |",
-        "",
-        "---",
-        "",
-        pull.body || "*No description.*"
-    ];
-    linelark.openVirtual({
-        key: "pr:" + pull.number,
-        name: "PR-" + pull.number + ".md",
-        label: "GitHub",
-        text: lines.join("\n"),
-        language: "markdown"
-    });
+    linelark.openURL(pull.html_url);
 }

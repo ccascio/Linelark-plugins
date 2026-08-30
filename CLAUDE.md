@@ -40,6 +40,64 @@ Then **Plugins ▸ Reload Plugins**. **Plugins ▸ Manage Plugins…** lists wha
 with the reason, and holds each plugin's log — everything from `linelark.log`, `console.log`,
 and any error that escaped, including one thrown after an `await`.
 
+## Publishing to linelark.com
+
+The catalog lives in the website checkout, `../Notepad4MacOS-Website`, and every command
+below is run **from there** — it reads this repository as its sibling. There is no public
+upload endpoint: the harness is owner-only, and it packs, uploads and records; a human
+approves.
+
+```bash
+cd ../Notepad4MacOS-Website
+
+npm run plugins:check                          # every bundle here, packed and validated,
+                                               # no network. Do this first, always.
+npm run plugins:submit -- --plugin sort-lines  # zip → R2, and a D1 row for review
+# …owner approves the release at /admin…
+npm run plugins:publish -- --plugin sort-lines # only an approved release; regenerates
+                                               # public/plugins/catalog.json
+npm run build && npx wrangler deploy           # the feed is a static file: until the site
+                                               # is deployed, nothing is public
+```
+
+The slug is the plugin's `name`, lowercased and hyphenated — "Sort Lines" is `sort-lines`,
+and that is what `--plugin` wants. Omitting `--plugin` does every bundle at once, which is
+almost never what is meant.
+
+**A released version is immutable, and that is the rule everything else follows from.** The
+archive is deterministic, its SHA-256 is recorded, and a resubmission whose bytes differ is
+refused rather than merged. So *any* edit to a bundle that has been submitted — a fixed
+typo, one reworded line of `description` — needs a version bump. Check what is already up
+before editing a manifest:
+
+```bash
+npx wrangler d1 execute convertprivately-privacy-analytics --remote --json \
+  --command "SELECT plugin_id, version, review_status FROM linelark_plugin_releases"
+```
+
+`review_status` runs `submitted → approved → published`, and `catalog_status` on the plugin
+stays `draft` until the first publication. Submitting is safe to repeat and safe to
+interrupt: the worst outcome is an unreferenced R2 object with the checksum it was going to
+have anyway.
+
+**The manifest's `description` is the plugin's entire public description.** It becomes
+`summary` in the ledger and the one line under the name in the catalog and in **Get
+Plugins…**, so it has to say what the plugin does without the README beside it.
+
+**The folder's `README.md` is what the reviewer reads.** Submitting copies it into the
+ledger's long `description` column, and the owner desk draws it under the plugin next to the
+permissions its manifest asks for — `git: write`, each host, each credential — which is the
+half of a review that decides anything. It is read from *beside* the bundle rather than
+from inside it, so it is not covered by the archive checksum: rewording a README costs no
+version, and re-publishing an unchanged bundle is how a corrected one gets in. Capped at
+64 KB, and kept out of the public feed on purpose — it is written for plugin authors, and
+nothing public renders it.
+
+The harness refuses symlinks, unsafe `main` paths, non-semantic versions, a missing main
+script, and bundles over 1,000 files or 20 MB uncompressed. `.DS_Store` is dropped for you.
+`../Notepad4MacOS-Website/DEPLOYMENT.md` is the fuller account, including R2 keys and what
+the app verifies before it installs anything.
+
 ## The manifest
 
 `id` and `name` are required; everything else has a default. `main` defaults to `main.js`.
@@ -49,7 +107,13 @@ written against, and a host that speaks an older one refuses to load it, saying 
 matters because an unknown node type is *skipped* rather than fatal — which is right, but
 means a plugin using a newer node on an older host silently loses whole sections of its
 panel instead of failing. Generation 2 covers `section`, `actions` and `button` nodes,
-`badgeTint`, `openDiff` and `repoDiscardAsync`; a plugin using any of them must say `2`.
+`badgeTint`, `openDiff` and `repoDiscardAsync`. Generation 3 covers the store (`storeGet`,
+`storeSet`, `storeRemove`, `storeKeys`), `copyToClipboard`, `exportFile`, `caretLine`, and a
+panel's `onChange` and `followsCaret`; a plugin using any of them must say `3`. Generation 4
+covers `openDiff`'s `onMerge` — arrows drawn down the middle of a diff — and must say `4`.
+Generation 5 covers `addContextMenuItem`. Generation 6 covers remote management
+(`repoAddRemoteAsync`, `repoSetRemoteURLAsync`, `repoRemoveRemoteAsync`) plus
+`openPluginSettings` and `openURL`. Generation 7 covers `setSecret` and `clearSecret`.
 
 ```json
 {
@@ -82,12 +146,15 @@ Registration  addCommand(id, title, fn) · addPanel({…}) · addPreview({…}) 
               log(msg) · apiVersion()
 Document      fileName() · filePath() · language() · isReadOnly()
 Reading       text() · length() · lineCount() · line(n) · getRange(loc, len)
-Selection     selection() · selectionRange() · setSelection(loc, len)
+Selection     selection() · selectionRange() · caretLine() · setSelection(loc, len)
 Writing       replaceSelection(s) · replaceRange(loc, len, s) · setText(s) · insert(s)
 Opening       openFile(path) · openVirtual({key, name, text, label, language})
               openDiff({key, name, patch, label}) · folderRoot()
 Scheduling    setTimeout · setInterval · clearTimeout · clearInterval · queueMicrotask
+Keeping       storeGet(key) · storeSet(key, value) · storeRemove(key) · storeKeys()
+Handing out   copyToClipboard(text) · exportFile({name, text})
 Network       fetch({url, method, headers, body, timeout}) · canReachNetwork() · hasSecret(name)
+Signing in    setSecret(name, value) · clearSecret(name)
 Git read      repoIsAvailable() · repoRoot() · repoHead() · repoLog(n) · repoFiles() · repoShow(path)
  (Studio)     repoTracking() · repoBranches() · repoRemotes()
               repoLogAsync(n) · repoFilesAsync() · repoShowAsync(path)
@@ -98,8 +165,8 @@ Git write     repoCanWrite() · repoStageAsync(paths) · repoUnstageAsync(paths)
   granted)    repoSwitchAsync(branch) · repoCreateBranchAsync(branch)
 ```
 
-Panel descriptor: `{id, title, symbol, side, render, onSelect, onSubmit}`. `symbol` is an SF Symbol;
-`side: "right"` puts it in the right dock. Node types:
+Panel descriptor: `{id, title, symbol, side, followsCaret, render, onSelect, onSubmit, onChange}`.
+`symbol` is an SF Symbol; `side: "right"` puts it in the right dock. Node types:
 
 ```js
 { type: "heading", text }
@@ -138,10 +205,34 @@ redraw does not reopen one somebody just shut. That makes `id` load-bearing: it 
 panel remembers the state against, so it has to be stable across draws. Sections nest three
 deep; a fourth is refused. An empty one is skipped, exactly as an empty `rows` is.
 
-A `field` is the one node that sends something back: `onSubmit(id, value)`. The plugin
-supplies the *initial* value and the view owns what is typed after that, so a redraw does not
-take a half-written sentence away — set `value` to something different to change it (empty
-after a successful commit, the same text back after a failed one).
+A `field` is the one node that sends something back: `onSubmit(id, value)` when the button is
+pressed, and `onChange(id, value)` roughly 0.6 s after typing stops, for a panel that saves
+rather than submits. The view owns what is typed, so a redraw does not take a half-written
+sentence away; the plugin changes what is in the box by handing back a *different* `value`
+(empty after a successful commit, the same text back after a failed one), and handing back
+the same one it last handed costs nothing.
+
+**Hand back what you have stored, never the live text.** Echoing what was just typed means
+`value` differs on every keystroke and the box is rewritten under the cursor. The stored text
+is the opposite: while somebody types it does not change, so the view leaves the box alone,
+and the moment a save lands it is *equal* to what the box holds. A plugin that instead
+freezes `value` at what the box said when it opened has a bug that only shows later — the
+field view is thrown away and rebuilt whenever the dock switches panels, and it comes back
+holding that frozen text rather than what was saved. So: `value: note.text`, every draw.
+
+**`onChange` arrives late, by construction.** It can land after the panel has moved on to
+something else, and changing `value` *flushes* the pending call rather than dropping it —
+losing the last half-second of typing every time the box was swapped would be the worse bug.
+Both together mean a plugin editing several things through one box must put the identity in
+the field's `id` (`note:ab12`, not `note`), because the delivered id is the one the call was
+scheduled with. And a plugin that *rewrites* a box — appending to it from elsewhere — gets
+the pre-rewrite text delivered a moment later: taking it at face value undoes the rewrite, so
+carry a revision in the id too and merge rather than replace (`story-bible` does this).
+
+**Redraw as soon as a save lands.** `onChange` should end in `refreshPanels()`. Otherwise
+whatever redraws the panel next hands the box `value` as it was *before* the save, and the
+text just typed appears to vanish. This is only safe if the node list does not change shape
+when it saves — see below.
 
 Preview descriptor: `{id, title, extensions, languages, render}` — a rendered view of a
 document, swapped in from the toolbar's Preview button (⇧⌘V) for files the `extensions` or
@@ -178,6 +269,26 @@ their context rather than the whole file, with a gap row marking each stretch gi
 send. It is otherwise a virtual buffer — same key-based tab reuse, same lifetime — so a
 `key` already used by `openVirtual` opens a second tab rather than replacing the first.
 
+**`openDiff` can be a merge tool, not only a view.** Given `onMerge`, the diff draws a pair
+of arrows in the strip between its two halves at every difference, tracks which one is
+current, scrolls to it, and puts ⌃/⌄ and Take-left/Take-right in a header bar. The handler is
+called as `onMerge(block, direction)`: `block` counts differences from the top of the patch —
+one unbroken run of changed rows is one difference — and `direction` is `"left"` or `"right"`,
+naming the file about to change. A plugin that generated the patch from its own list of
+differences, in order, can use `block` as an index straight into it.
+
+That numbering is the whole contract, and it is worth a test rather than an assumption: the
+view counts runs in the text it was given, the plugin counts hunks in the arrays it diffed,
+and nothing checks that those agree. `compare-files` fuzzes it — 600 random pairs, the view's
+count against the plugin's — because an arrow that moves the wrong lines is the one bug a
+merge tool must not have.
+
+The handler is registered per `key` and *re-*registered on every `openDiff`, so reopening
+with a fresh patch never leaves the old closure behind. Answering an arrow means recomputing
+and calling `openDiff` again with the same key, which replaces the tab's text; the view keeps
+its place, and the difference just taken is gone, so the number that was current now names
+the one after it.
+
 `fetch` resolves to `{status, ok, headers, body, isText}`.
 
 ## Rules that bite
@@ -201,10 +312,35 @@ send. It is otherwise a virtual buffer — same key-based tab reuse, same lifeti
 - **Make one edit, not many.** Compute the whole replacement, apply it with a single
   `replaceRange`. A loop of small edits is a stack of undo steps, and every write invalidates
   offsets taken before it. Offsets are UTF-16 code units.
+- **A node's identity is its position in the list.** A box's typed text, and a section's
+  open-or-shut, belong to the *nth* node rather than to the id written on it. So a panel
+  with a field in it must not change shape while somebody is typing: a status line that
+  appears once there is something to say slides every box below it onto another record's
+  contents. Draw the line always and change its words.
+- **`render()` must not change the document.** It is called from the view's own update, so
+  a `setText` or `replaceRange` inside one is editing the thing being drawn while it is
+  being drawn. A panel that reacts to the front tab arriving — `compare-files` opens a file
+  so it can write into it — should hand the work to `setTimeout(fn, 0)` and let the draw
+  finish first.
 - **A missing JS property reads back as the string `"undefined"`**, not as nothing. Leave a
   descriptor field out entirely rather than setting it to `undefined`.
 - **No watchdog.** A script that never yields hangs the editor. Timers are clamped to 4 ms
   and capped at 64 per plugin.
+- **The store is strings, per plugin, and capped.** `storeGet`/`storeSet` keep a plugin's
+  own data in Application Support between launches — one JSON file per plugin id, so there
+  is no path to name and nothing to traverse out of. Values are strings: use
+  `JSON.stringify`. `storeSet` *returns* the refusal rather than throwing (256 KB a value,
+  4 MB and 2,000 keys a plugin), and a panel that ignores it is a panel that looks like it
+  is saving and is not. Writes are debounced ~0.75 s and flushed when the app quits.
+- **`followsCaret` is the only way a panel is redrawn by something the user does
+  constantly.** It is opt-in for that reason: the signal is coalesced to 200 ms, but a
+  panel that reads git or walks the buffer must not take it. `caretLine()` is the answer it
+  exists for — working the line out from `selectionRange()` means scanning the document on
+  every keystroke.
+- **`exportFile({name, text})` is the only way a plugin writes to disk, and it cannot do so
+  quietly.** The save panel *is* the consent, so there is no path argument: a plugin offers
+  a name and the text, and where it goes belongs to the user. `false` is usually just a
+  cancelled panel, which is not an error.
 - **Studio-only:** git and network. `repoIsAvailable()`, `repoCanWrite()` and
   `canReachNetwork()` answer `false` in the sandboxed App Store edition — check and explain,
   or the panel reads as broken.
@@ -229,6 +365,22 @@ send. It is otherwise a virtual buffer — same key-based tab reuse, same lifeti
 - **A secret is never readable.** `hasSecret(name)` returns a boolean and nothing else; the
   host attaches the value to requests bound for the host the manifest tied it to. No request
   signing, no secret in a body.
+- **A plugin may write a credential it obtained itself, never read one.** `setSecret(name,
+  value)` files a token in the Keychain slot the manifest declares — it exists for a browser
+  sign-in, where the token arrives in the plugin's hands and the only alternative is the
+  plugin store, which is a plaintext file. Handing back a value already held teaches the
+  plugin nothing, so the rule above is untouched. It needs the declaration *and* network
+  consent, caps the value at 4 KB, and returns a refusal string or nothing, as `storeSet`
+  does — a sign-in that failed to save looks exactly like one that worked until the next
+  request, so check it. `clearSecret(name)` is signing out and needs only the declaration.
+- **A browser login means the device flow, not a redirect.** There is no URL scheme to
+  redirect back to and no socket a plugin can listen on, so the OAuth flow that ends in a
+  callback cannot be completed from here. GitHub's device flow can: ask for a code, show it,
+  poll until it is approved. `openURL` is honoured only while the click that asked for it is
+  still on the stack — an `await` ends that — so the click that fetches the code cannot also
+  open the page. Opening it is a *second* button, which is a second user action: show the
+  code first, then let it be pressed. Opening the browser first instead is a tab asking for
+  a code the user has not been shown, arriving in the window behind it. `github` does this.
 - **Changing what you ask for revokes consent.** Adding a host, or moving a credential to
   another header, makes the user grant network access again and orphans the stored key — a
   version bump alone does not. Check `hasSecret` rather than assuming it survived.

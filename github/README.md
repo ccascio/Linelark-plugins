@@ -1,12 +1,12 @@
 # GitHub
 
-A git client in the side panel. Stage, commit, fetch, pull and push; read the diff of
-anything that has changed; switch and create branches — and, if you give it a token, see the
-open pull requests and the state of the checks on your last commit.
+A git client in the side panel. Stage, commit, fetch, pull and push; add, edit and remove
+remotes; read the diff of anything that has changed; switch and create branches — and sign
+in to GitHub for private repositories, pull requests and checks.
 
-Adds an icon to the side panel's switcher and five commands under **Plugins ▸ GitHub**:
-*Refresh Repository Panel*, *Compare This File With HEAD*, *Stage This File*, *Pull* and
-*Push*.
+Adds an icon to the side panel's switcher and eight commands under **Plugins ▸ GitHub**:
+*Refresh Repository Panel*, *Compare This File With HEAD*, *Stage This File*, *Pull*,
+*Push*, *Sign In to GitHub…*, *GitHub Account…* and *Open Repository on GitHub*.
 
 ## Before it can do anything
 
@@ -17,10 +17,43 @@ Two switches in **Plugins ▸ Manage Plugins…**, both off until you turn them 
 - **Allow network access** — only for the github.com section at the bottom. Everything above
   it works offline.
 
-The **GitHub token** field is optional. Without one, pull requests and checks work for public
-repositories at the anonymous rate limit (60 requests an hour); a fine-grained token with
-read access to the repository lifts that and reaches private ones. The plugin never sees the
-value: Linelark stores it and attaches it to requests bound for `api.github.com`.
+The **GitHub account** section in the panel says whether API requests are anonymous or
+signed in. Without a credential, pull requests and checks work for public repositories at
+the anonymous rate limit (60 requests an hour); signing in lifts that and reaches private
+ones.
+
+**Sign in with your browser** runs GitHub's OAuth *device flow*, in two clicks. The first
+asks GitHub for an eight-character code, which the panel shows and copies to your clipboard.
+The button then becomes **Open github.com/login/device**; pressing it opens that page with
+the code still on the clipboard, and you paste it there and approve. The plugin has been
+polling GitHub since the code arrived, so the panel says *Signed in to GitHub.* a few seconds
+later by itself.
+
+Two clicks rather than one on purpose. Opening the browser first is a tab asking for a code
+that has not been displayed yet — the code would be arriving in an editor behind it.
+**Cancel sign-in** stops the polling, and a code that goes unapproved expires by itself after
+fifteen minutes.
+
+There is no redirect back into Linelark, and that is the reason this uses the device flow
+rather than the usual OAuth one: the editor registers no URL scheme and a plugin cannot
+listen on a socket, so a callback has nowhere to land. The device flow is the grant designed
+for programs in exactly that position. The scope asked for is `repo`, which is the narrowest
+OAuth scope that covers a private repository's pull requests and check runs.
+
+**Paste a token instead** opens this plugin's own settings with the **GitHub token** field
+selected, and **Create a token on GitHub** opens GitHub's fine-grained-token page — a
+fine-grained token with read access to the repository does the same job without signing an
+OAuth app in. **Sign out** removes whichever of the two is stored.
+
+Either way the plugin never sees the value. It hands the token it obtained straight to the
+host, which keeps it in the Keychain and attaches it only to requests bound for
+`api.github.com`; there is no call that reads one back, so the plugin is left holding a
+boolean. A credential is never written to the plugin's own store, which is an ordinary file
+in Application Support.
+
+This signs in the GitHub API half of the panel. Git fetch, pull and push continue to use the
+normal git credential helper, so an existing SSH key, Keychain credential or `gh` login keeps
+working exactly as it does in the terminal.
 
 ## What it shows
 
@@ -47,6 +80,19 @@ was tried, and it made the panel show the working tree as it had been before the
 and go on saying "read-only" for two seconds after permission was granted. Anything the user
 can change out of band must not come from a cache.
 
+**Remotes are visible and editable.** Expand **Remotes**, select one to change its URL or
+remove it, or enter a name and URL to add another. Names and URLs are validated by the host,
+all changes require **Allow changes to git**, and Linelark itself confirms removal. Removing
+a remote does not delete local files, branches or commits.
+
+**GitHub links open where they belong.** A pull-request row opens the pull request in the
+default browser, and the account section can open the repository, the device-flow page or
+GitHub's token page. `openURL` is honoured only while the click that asked for it is still
+running, which is why opening the device page is a button of its own rather than something
+that happens at the end of the sign-in click. The device page's URL comes from GitHub's own
+reply and is opened only if it is a `github.com` one.
+Only absolute `http` and `https` links can cross that host API.
+
 ## What it will not do
 
 None of this is the plugin being careful. It is the API refusing, which is the only kind of
@@ -64,15 +110,21 @@ safety worth relying on:
   answers silently afterwards.
 
 Also missing, deliberately or otherwise: no merge or rebase, no tags, no stash, no submodule
-handling, no commit amending, no per-hunk staging, and no way to open a pull request in your
-browser — a plugin cannot open a URL. A pull request opens as a Markdown tab instead, where
-**Preview** (⇧⌘V) makes its links clickable.
+handling, no commit amending, no per-hunk staging, and no clone or repository-initialization
+flow. Sign-in reaches the API half only — it cannot authenticate a push, which belongs to
+git and its credential helper.
 
 ## Studio only
 
 Git needs subprocesses and the sandbox blocks them, so the Mac App Store edition ships
 without the git reader entirely. `repoIsAvailable()` answers `false` there and the panel says
 so rather than coming up empty, which reads as broken.
+
+## Checking a change
+
+`node test.mjs` drives the panel against a stubbed host: the whole device flow is scripted
+reply by reply — pending, `slow_down`, approved, expired, cancelled — because a polling loop
+driven by what a server says is the part of this that cannot be checked by reading it.
 
 ## Known limits
 
@@ -86,11 +138,13 @@ The history graph is capped at 120 commits, and the check-run roll-up describes 
 ## API used
 
 `addPanel` (with `onSelect` and `onSubmit`), `addCommand`, `refreshPanels`, `openFile`,
-`openVirtual`, `log`, `filePath`, `folderRoot`, `fetch`, `canReachNetwork`, `hasSecret`,
+`openURL`, `openPluginSettings`, `log`, `filePath`, `folderRoot`, `fetch`,
+`canReachNetwork`, `hasSecret`, `setSecret`, `clearSecret`, `copyToClipboard`,
 `repoIsAvailable`, `repoRoot`, `repoHead`, `repoFiles`, `repoLog`, `repoTracking`,
 `repoBranches`, `repoRemotes`, `repoDiffAsync`, `repoCanWrite`, `repoStageAsync`,
 `repoUnstageAsync`, `repoCommitAsync`, `repoFetchAsync`, `repoPullAsync`, `repoPushAsync`,
-`repoSwitchAsync`, `repoCreateBranchAsync`.
+`repoSwitchAsync`, `repoCreateBranchAsync`, `repoAddRemoteAsync`,
+`repoSetRemoteURLAsync`, `repoRemoveRemoteAsync`.
 
 Panel nodes: `rows`, `tree`, `section`, `actions`, `button`, `heading`, `text`, `graph`, `field`.
 Opening: `openFile`, `openDiff` — a clicked file's patch is drawn side by side.

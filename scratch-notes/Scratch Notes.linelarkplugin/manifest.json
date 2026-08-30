@@ -1,10 +1,10 @@
 {
   "id": "com.linelark.example.notes",
   "name": "Scratch Notes",
-  "version": "1.0.0",
-  "apiVersion": 1,
+  "version": "2.0.1",
+  "apiVersion": 3,
   "main": "main.js",
   "author": "Linelark",
-  "description": "A right-dock panel listing the TODOs in the file you are looking at.",
+  "description": "A scratchpad that belongs to the file you are looking at: notes pinned to a line, saved as you type, and brought back when you return to them.",
   "pricing": "free"
 }

@@ -1,0 +1,10 @@
+{
+  "id": "com.linelark.example.storybible",
+  "name": "Story Bible",
+  "version": "1.0.0",
+  "apiVersion": 3,
+  "main": "main.js",
+  "author": "Linelark",
+  "description": "Characters, plot and places kept beside the story rather than inside it — named panes that belong to the whole folder, save themselves as you type, and export as one file.",
+  "pricing": "free"
+}
