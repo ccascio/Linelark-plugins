@@ -1,14 +1,17 @@
 {
   "id": "com.linelark.example.github",
   "name": "GitHub",
-  "version": "2.3.0",
-  "apiVersion": 7,
+  "version": "2.4.0",
+  "apiVersion": 8,
   "main": "main.js",
   "author": "Linelark",
-  "description": "A git client in the side panel: stage, commit, manage remotes, pull, push, and read diffs — plus browser sign-in to GitHub, pull requests, checks, and repository links.",
+  "description": "A git client in the side panel: pick which project in the workspace it acts on, stage, commit, manage remotes, pull, push, and read diffs — plus browser sign-in to GitHub, pull requests, checks, and repository links.",
   "pricing": "free",
   "git": "write",
-  "hosts": ["api.github.com", "github.com"],
+  "hosts": [
+    "api.github.com",
+    "github.com"
+  ],
   "secrets": [
     {
       "name": "token",

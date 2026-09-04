@@ -13,6 +13,13 @@
 // removing a remote are confirmed by Linelark itself. That is a property of Linelark, not
 // of this code being careful, which is the only kind of safety worth relying on.
 //
+// **The panel says which project it is about, and lets you change it.** A window can hold
+// several folders, and before generation 8 every git call went to whichever one held the
+// tab in front — so this panel silently configured whichever repository you had last
+// clicked into. It cost a remote added to the wrong project. `linelark.workspaceFolders()`
+// names them and `repoSelectFolder` binds the calls to one, which is what the Project
+// section at the top is.
+//
 // **A panel has one click per row.** So clicking a changed file *selects* it and shows its
 // diff, and the actions for that file appear as their own rows underneath. Trying to fit
 // "open the diff" and "stage it" onto one row would mean guessing which was meant.
@@ -31,6 +38,9 @@ var state = {
     outcome: null,
     message: "",
     branch: "",
+    // The workspace folder every git call is bound to, or null for "follow the tab in
+    // front", which is what this panel always did and still does with one folder open.
+    project: null,
     remoteEntry: "",
     selectedRemote: null,
     remoteURL: "",
@@ -126,6 +136,72 @@ var cache = null;
 
 function invalidate() {
     cache = null;
+}
+
+// Every folder the window has open. The host answers, so the names are the ones the
+// sidebar shows rather than anything this plugin invents.
+function projects() {
+    return linelark.workspaceFolders();
+}
+
+// Binds the host's git calls to the chosen project, and is called before every read and
+// every write.
+//
+// Re-asserted rather than set once: the host drops a binding whose folder the window no
+// longer has, so a project closed while the panel was open falls back to the front tab
+// instead of quietly answering for a folder that is gone. Re-selecting a folder that is
+// still there costs nothing.
+function bindProject() {
+    if (state.project && !linelark.repoSelectFolder(state.project)) {
+        state.project = null;
+        linelark.repoSelectFolder("");
+    } else if (!state.project) {
+        linelark.repoSelectFolder("");
+    }
+    invalidate();
+}
+
+// What the panel calls the project it is acting on. The bound one when there is one, and
+// otherwise whichever folder the front tab put us in — said out loud either way, because
+// the whole point is that it should never have to be guessed.
+function projectName() {
+    var bound = linelark.repoSelectedFolder();
+    var found = null;
+    projects().forEach(function (folder) {
+        if (bound ? folder.path === bound : folder.isActive) { found = folder; }
+    });
+    return found ? found.name : null;
+}
+
+// Shown only when there is a choice to make. One folder needs no picker, and a list of one
+// above every panel is chrome explaining a decision nobody has.
+function projectNodes() {
+    var folders = projects();
+    if (folders.length < 2) { return []; }
+    var bound = linelark.repoSelectedFolder();
+    return [{
+        type: "rows",
+        rows: folders.map(function (folder) {
+            var chosen = bound ? folder.path === bound : folder.isActive;
+            return {
+                id: "project:" + folder.path,
+                title: folder.name,
+                detail: folder.path,
+                symbol: chosen ? "checkmark.circle.fill" : "folder",
+                // A folder that is not a repository is still offered — it is a project in
+                // this workspace — but saying so beforehand beats letting somebody pick it
+                // and read "No repository".
+                badge: folder.isRepository ? null : "no git",
+                badgeTint: folder.isRepository ? null : "negative"
+            };
+        })
+    }, {
+        type: "text",
+        text: bound
+            ? "Every git action below is about this project."
+            : "Following the tab in front. Pick a project to pin it.",
+        style: "secondary"
+    }];
 }
 
 function repository() {
@@ -265,7 +341,9 @@ function remoteNodes() {
             })
         });
     } else {
-        nodes.push({ type: "text", text: "No remote is configured for this repository." });
+        nodes.push({ type: "text",
+                     text: "No remote is configured for " + (projectName() || "this project")
+                         + "." });
     }
 
     if (state.selectedRemote) {
@@ -293,7 +371,11 @@ function remoteNodes() {
 
     if (repo.canWrite) {
         nodes.push({
-            type: "field", id: "addRemote", label: "Add a remote",
+            // Named, because this is the one control whose wrong target is invisible until
+            // somebody pushes: adding a remote succeeds just as quietly in the wrong
+            // repository as in the right one.
+            type: "field", id: "addRemote",
+            label: "Add a remote for " + (projectName() || "this project"),
             placeholder: "origin https://github.com/owner/repository.git",
             value: state.remoteEntry, multiline: false, submit: "Add",
             enabled: !state.busy
@@ -413,22 +495,27 @@ function selectionActions() {
 // MARK: - The panel
 
 function panelNodes() {
-    invalidate();
+    bindProject();
+    // Before the early return below, so a window whose front tab is in a folder with no
+    // repository can still be pointed at one of the others. Putting it after was the first
+    // draft, and it made the picker unreachable in exactly the case that needs it.
+    var project = section("project", "Project" + (projectName() ? " · " + projectName() : ""),
+                          false, projectNodes());
     if (!linelark.repoIsAvailable()) {
-        return [
+        return project.concat([
             { type: "heading", text: "No repository" },
             { type: "text",
               text: linelark.folderRoot()
-                  ? "The open folder is not inside a git repository."
+                  ? "This project is not inside a git repository."
                   : "Open a folder to see its repository." },
             // Said here rather than nowhere: in the sandboxed edition this is not a
             // temporary state to be fixed by opening a different folder.
             { type: "text",
               text: "Git needs Linelark Studio; the Mac App Store edition cannot run it." }
-        ];
+        ]);
     }
 
-    var nodes = [{ type: "rows", rows: [branchRow()] }];
+    var nodes = project.concat([{ type: "rows", rows: [branchRow()] }]);
     nodes.push(remoteActions());
 
     if (state.outcome) {
@@ -563,7 +650,9 @@ async function showDiff(path, isStaged) {
 }
 
 async function handle(id) {
-    invalidate();
+    // Before anything is read or written: a press arrives long after the panel was drawn,
+    // and the window may have closed the folder in between.
+    bindProject();
     if (id === "noop") {
         linelark.refreshPanels();
         return;
@@ -631,6 +720,19 @@ async function handle(id) {
             }
             return;
         }
+        return;
+    }
+
+    if (kind === "project") {
+        // Pressing the project already bound unpins it, which is how you get back to
+        // following the tab in front without hunting for a control that says so.
+        state.project = state.project === rest ? null : rest;
+        state.selected = null;
+        state.selectedRemote = null;
+        state.remoteURL = "";
+        state.outcome = null;
+        bindProject();
+        linelark.refreshPanels();
         return;
     }
 

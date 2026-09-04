@@ -113,7 +113,9 @@ panel's `onChange` and `followsCaret`; a plugin using any of them must say `3`. 
 covers `openDiff`'s `onMerge` — arrows drawn down the middle of a diff — and must say `4`.
 Generation 5 covers `addContextMenuItem`. Generation 6 covers remote management
 (`repoAddRemoteAsync`, `repoSetRemoteURLAsync`, `repoRemoveRemoteAsync`) plus
-`openPluginSettings` and `openURL`. Generation 7 covers `setSecret` and `clearSecret`.
+`openPluginSettings` and `openURL`. Generation 7 covers `setSecret` and `clearSecret`. Generation 8 covers
+`workspaceFolders()` and `repoSelectFolder(path)` — which project in a multi-root workspace
+the git calls are about.
 
 ```json
 {
@@ -139,6 +141,15 @@ branches. Like `hosts` it is a *request*: the user grants it separately in Manag
 against the manifest's capability fingerprint, so adding a host later revokes the git
 permission too. Reading git needs no declaration.
 
+**`folderRoot()` is one folder, not the project.** It answers with whichever workspace
+folder holds the tab in front, so in a multi-root window it moves as the user clicks about.
+For anything that *configures* something — a remote, a branch — that is a trap: the action
+succeeds just as quietly in the wrong repository as in the right one, and the GitHub plugin
+added a remote to the wrong project before generation 8 existed. `workspaceFolders()` names
+them all and `repoSelectFolder(path)` binds the git calls to one; a plugin that never selects
+keeps the old behaviour. Only a folder the window actually has can be chosen, so this is a
+way to stop guessing rather than a way to reach further.
+
 ## The API
 
 ```
@@ -149,12 +160,13 @@ Reading       text() · length() · lineCount() · line(n) · getRange(loc, len)
 Selection     selection() · selectionRange() · caretLine() · setSelection(loc, len)
 Writing       replaceSelection(s) · replaceRange(loc, len, s) · setText(s) · insert(s)
 Opening       openFile(path) · openVirtual({key, name, text, label, language})
-              openDiff({key, name, patch, label}) · folderRoot()
+              openDiff({key, name, patch, label}) · folderRoot() · workspaceFolders()
 Scheduling    setTimeout · setInterval · clearTimeout · clearInterval · queueMicrotask
 Keeping       storeGet(key) · storeSet(key, value) · storeRemove(key) · storeKeys()
 Handing out   copyToClipboard(text) · exportFile({name, text})
 Network       fetch({url, method, headers, body, timeout}) · canReachNetwork() · hasSecret(name)
 Signing in    setSecret(name, value) · clearSecret(name)
+Which project repoSelectFolder(path) · repoSelectedFolder()
 Git read      repoIsAvailable() · repoRoot() · repoHead() · repoLog(n) · repoFiles() · repoShow(path)
  (Studio)     repoTracking() · repoBranches() · repoRemotes()
               repoLogAsync(n) · repoFilesAsync() · repoShowAsync(path)
