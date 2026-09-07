@@ -233,9 +233,19 @@ function mdBlock(token, source) {
                  spans: token.tokens ? mdSpans(token.tokens) : [span(decode(token.text), {})],
                  source: source };
     case "code":
-        return { type: "code", text: token.text,
-                 language: token.lang ? String(token.lang).split(/\s+/)[0] : "",
-                 source: source };
+        var language = token.lang ? String(token.lang).split(/\s+/)[0] : "";
+        // A ```mermaid fence is a picture in a document that happens to be
+        // written as text, so it is drawn rather than shown as source. Only when
+        // it can be: an unknown header, a diagram past its caps, or one that
+        // parses to nothing all fall through to the code block, which is
+        // readable and honest about not having been rendered.
+        if (/^mermaid$/i.test(language)) {
+            var drawn = renderDiagram(token.text, source);
+            if (drawn) {
+                return drawn;
+            }
+        }
+        return { type: "code", text: token.text, language: language, source: source };
     case "blockquote":
         return { type: "quote", children: mdNested(token.tokens), source: source };
     case "list":
@@ -803,6 +813,1249 @@ function renderHTML(text) {
 // says, so a `.md` file offers "Preview as Markdown" and a `.html` file "Preview as HTML".
 // Which documents each claims is declared rather than asked — the toolbar reads it on every
 // redraw, and running a plugin's JavaScript there would run it on every keystroke.
+
+// ---------------------------------------------------------------------------
+// Diagrams
+//
+// A subset of Mermaid, parsed and *laid out* here. Linelark draws boxes, lines,
+// polygons and labels in a coordinate space of our choosing and knows nothing
+// about what any of it means — there is no `class`, no `lifeline` and no
+// `association` on the other side of `linelark.addPreview`. That is what makes
+// a diagram language a plugin release rather than an editor release, and it is
+// the only shape this could take: the editor draws every pixel of a preview on
+// purpose, so there is no WebView to hand an SVG to and no image to fetch.
+//
+// The price is that positioning is ours, including the part that needs a font.
+// `linelark.measureText` answers with the same NSFont the editor will paint
+// with, which is the whole reason a box ends up the size of the words in it.
+// ---------------------------------------------------------------------------
+
+// A diagram is laid out on every keystroke that settles, in an interpreter with
+// no JIT, so it is capped by what it would cost rather than by what is
+// reasonable to draw. Past any of these the source is shown as a code block:
+// unrendered and readable beats half-rendered and wrong.
+var DIAGRAM_MAX_LINES = 1200;
+var DIAGRAM_MAX_NODES = 240;
+var DIAGRAM_MAX_EDGES = 480;
+
+// Spacing, in points, in the diagram's own space.
+var NODE_PAD_X = 14;
+var NODE_PAD_Y = 9;
+var MIN_NODE_WIDTH = 46;
+var RANK_GAP = 52;
+var SIBLING_GAP = 26;
+var FIGURE_MARGIN = 12;
+var LABEL_SIZE = 13;
+var SMALL_LABEL_SIZE = 11;
+
+// Every call crosses into Swift, and a class diagram measures every member of
+// every class — with the same words recurring all over a real document. The
+// cache is rebuilt per render, so it can never answer with a stale font size.
+function Measurer() {
+    this.cache = {};
+}
+
+Measurer.prototype.size = function (text, size, bold, mono) {
+    var key = size + (bold ? "b" : "-") + (mono ? "m" : "-") + " " + text;
+    var hit = this.cache[key];
+    if (hit) {
+        return hit;
+    }
+    var measured = linelark.measureText(text, { size: size, bold: !!bold, mono: !!mono });
+    // A host that answered with nothing would otherwise lay every box on top of
+    // every other, which reads as a broken editor rather than a missing call.
+    var answer = {
+        width: measured && measured.width > 0 ? measured.width : text.length * size * 0.6,
+        height: measured && measured.height > 0 ? measured.height : size * 1.35
+    };
+    this.cache[key] = answer;
+    return answer;
+};
+
+// Collects shapes in the order they are painted. Order is the only z-ordering
+// there is, so edges go in before nodes and labels go in last.
+function Figure() {
+    this.shapes = [];
+}
+
+Figure.prototype.box = function (x, y, width, height, options) {
+    options = options || {};
+    this.shapes.push({
+        type: options.ellipse ? "ellipse" : "box",
+        x: x, y: y, width: width, height: height,
+        radius: options.radius || 0,
+        fill: options.fill || "surface",
+        stroke: options.stroke || "border",
+        strokeWidth: options.strokeWidth || 1,
+        dashed: !!options.dashed
+    });
+};
+
+Figure.prototype.line = function (points, options) {
+    options = options || {};
+    this.shapes.push({
+        type: "line", points: points,
+        stroke: options.stroke || "border",
+        strokeWidth: options.strokeWidth || 1,
+        dashed: !!options.dashed,
+        arrowStart: !!options.arrowStart,
+        arrowEnd: !!options.arrowEnd,
+        closed: !!options.closed,
+        fill: options.fill || "none"
+    });
+};
+
+Figure.prototype.label = function (text, x, y, options) {
+    options = options || {};
+    this.shapes.push({
+        type: "label", text: text, x: x, y: y,
+        size: options.size || LABEL_SIZE,
+        align: options.align || "center",
+        baseline: options.baseline || "middle",
+        bold: !!options.bold,
+        italic: !!options.italic,
+        mono: !!options.mono,
+        ink: options.ink || "foreground"
+    });
+};
+
+// A label sitting on an edge, with a patch of page under it so the line does
+// not run through the words. Deliberately not a bordered box: that reads as
+// another node, which is exactly what an edge label is not.
+Figure.prototype.edgeLabel = function (measurer, text, x, y) {
+    var size = measurer.size(text, SMALL_LABEL_SIZE, false, false);
+    this.box(x - size.width / 2 - 3, y - size.height / 2 - 1,
+             size.width + 6, size.height + 2,
+             { fill: "background", stroke: "none" });
+    this.label(text, x, y, { size: SMALL_LABEL_SIZE, ink: "secondary" });
+};
+
+// What render() hands back for one diagram, or null when there is nothing to
+// draw. The margin is added here rather than by every layout in turn.
+Figure.prototype.figure = function (width, height, label, source) {
+    if (!this.shapes.length || !(width > 0) || !(height > 0)) {
+        return null;
+    }
+    var shifted = this.shapes.map(function (shape) {
+        return shiftShape(shape, FIGURE_MARGIN, FIGURE_MARGIN);
+    });
+    return {
+        type: "figure", source: source,
+        width: width + FIGURE_MARGIN * 2, height: height + FIGURE_MARGIN * 2,
+        label: label, shapes: shifted
+    };
+};
+
+function shiftShape(shape, dx, dy) {
+    if (shape.type === "line") {
+        shape.points = shape.points.map(function (point) {
+            return { x: point.x + dx, y: point.y + dy };
+        });
+        return shape;
+    }
+    shape.x += dx;
+    shape.y += dy;
+    return shape;
+}
+
+// The lines of a diagram, with what nobody is meant to read taken out: Mermaid
+// comments, blank lines, and the trailing semicolons its grammar allows.
+function diagramLines(source) {
+    var lines = [];
+    var raw = String(source).split(/\r\n|\r|\n/);
+    for (var i = 0; i < raw.length && lines.length <= DIAGRAM_MAX_LINES; i++) {
+        var line = raw[i].replace(/%%.*$/, "").replace(/;\s*$/, "").trim();
+        if (line) {
+            lines.push(line);
+        }
+    }
+    return lines;
+}
+
+// Quoted or bare, with the escapes Mermaid actually uses turned back into what
+// they stand for. `<br>` is the common one and it is a *line break*: a label
+// that keeps it as three words is a box a third too wide with a stray tag
+// through the middle of it.
+function diagramText(raw) {
+    var text = String(raw == null ? "" : raw).trim();
+    var quoted = text.match(/^"([\s\S]*)"$/);
+    if (quoted) {
+        text = quoted[1];
+    }
+    return text.replace(/<br\s*\/?>/gi, "\n")
+        .replace(/#quot;/g, '"')
+        .replace(/\\n/g, "\n")
+        .trim();
+}
+
+// A multi-line label: as wide as its widest line and as tall as all of them.
+function measureLines(measurer, text, size, bold, mono) {
+    var lines = String(text).split("\n");
+    var width = 0;
+    var height = 0;
+    for (var i = 0; i < lines.length; i++) {
+        var measured = measurer.size(lines[i] || " ", size, bold, mono);
+        width = Math.max(width, measured.width);
+        height += measured.height;
+    }
+    return { width: width, height: height, lines: lines };
+}
+
+// Draws one centred on a point, since a label is a single line to the host.
+function drawLines(figure, measurer, text, x, y, options) {
+    options = options || {};
+    var size = options.size || LABEL_SIZE;
+    var measured = measureLines(measurer, text, size, options.bold, options.mono);
+    var lineHeight = measured.height / measured.lines.length;
+    var top = y - measured.height / 2 + lineHeight / 2;
+    for (var i = 0; i < measured.lines.length; i++) {
+        figure.label(measured.lines[i], x, top + i * lineHeight, options);
+    }
+}
+
+// Which diagram this is. Mermaid's header is its first word, and anything that
+// is not one of ours is left alone rather than half-parsed — an unknown header
+// means the fence is shown as source, which is what the reader of a document
+// written for a newer Mermaid should get.
+function renderDiagram(source, sourceOffset) {
+    var lines = diagramLines(source);
+    if (!lines.length || lines.length > DIAGRAM_MAX_LINES) {
+        return null;
+    }
+    var header = lines[0];
+    var measurer = new Measurer();
+    var flow = header.match(/^(?:flowchart|graph)\s+(TB|TD|BT|LR|RL)?/i);
+    if (flow) {
+        return layoutGraph(parseFlow(lines.slice(1)), (flow[1] || "TD").toUpperCase(),
+                           measurer, sourceOffset, "Flowchart");
+    }
+    if (/^stateDiagram(-v2)?\b/i.test(header)) {
+        return layoutGraph(parseState(lines.slice(1)), directionOf(lines, "TD"),
+                           measurer, sourceOffset, "State diagram");
+    }
+    if (/^classDiagram(-v2)?\b/i.test(header)) {
+        return layoutGraph(parseClass(lines.slice(1)), directionOf(lines, "TD"),
+                           measurer, sourceOffset, "Class diagram");
+    }
+    if (/^sequenceDiagram\b/i.test(header)) {
+        return layoutSequence(parseSequence(lines.slice(1)), measurer, sourceOffset);
+    }
+    return null;
+}
+
+// `direction LR` in the body, which is how state and class diagrams say it.
+function directionOf(lines, fallback) {
+    for (var i = 0; i < lines.length; i++) {
+        var found = lines[i].match(/^direction\s+(TB|TD|BT|LR|RL)\b/i);
+        if (found) {
+            return found[1].toUpperCase();
+        }
+    }
+    return fallback;
+}
+
+// A graph, before anything has been positioned. One shape for flowcharts, state
+// diagrams and class diagrams, because all three are boxes joined by lines and
+// only the boxes differ — which is the whole reason one layout serves them.
+function Graph() {
+    this.nodes = [];
+    this.byID = {};
+    this.edges = [];
+    this.overflowed = false;
+}
+
+Graph.prototype.node = function (id, options) {
+    var existing = this.byID[id];
+    if (existing) {
+        // A node named again with a label keeps the label: `A --> B` then
+        // `B[Done]` is the ordinary way a flowchart is written.
+        if (options && options.text) {
+            existing.text = options.text;
+            existing.shape = options.shape || existing.shape;
+        }
+        return existing;
+    }
+    if (this.nodes.length >= DIAGRAM_MAX_NODES) {
+        this.overflowed = true;
+        return null;
+    }
+    options = options || {};
+    var node = {
+        id: id,
+        text: options.text || id,
+        shape: options.shape || "rect",
+        members: options.members || null,
+        index: this.nodes.length
+    };
+    this.nodes.push(node);
+    this.byID[id] = node;
+    return node;
+};
+
+Graph.prototype.edge = function (from, to, options) {
+    if (!from || !to) {
+        return;
+    }
+    if (this.edges.length >= DIAGRAM_MAX_EDGES) {
+        this.overflowed = true;
+        return;
+    }
+    options = options || {};
+    this.edges.push({
+        from: from.id, to: to.id,
+        text: options.text || "",
+        dashed: !!options.dashed,
+        thick: !!options.thick,
+        arrowEnd: options.arrowEnd !== false,
+        arrowStart: !!options.arrowStart,
+        headStart: options.headStart || null,
+        headEnd: options.headEnd || null
+    });
+};
+
+// The bracket pairs Mermaid uses for node shapes, longest first — `[[` has to
+// be tried before `[`, or a subroutine box parses as a rectangle whose label
+// begins with a bracket.
+var NODE_SHAPES = [
+    { open: "([", close: "])", shape: "stadium" },
+    { open: "[[", close: "]]", shape: "subroutine" },
+    { open: "[(", close: ")]", shape: "cylinder" },
+    { open: "((", close: "))", shape: "circle" },
+    { open: "{{", close: "}}", shape: "hexagon" },
+    { open: "[", close: "]", shape: "rect" },
+    { open: "(", close: ")", shape: "rounded" },
+    { open: "{", close: "}", shape: "diamond" },
+    { open: ">", close: "]", shape: "flag" }
+];
+
+// The three connector families, each of which may carry its label inside itself
+// (`-- yes -->`) as well as after it (`-->|yes|`). Written as one regex per
+// family rather than one for all three: the families differ in what may appear
+// *inside* them, and a single pattern that allowed everything would swallow a
+// node id on the far side of a malformed line.
+var CONNECTORS = [
+    { re: /^-\.(?:([^.|]*)\.)?-+(>)?/, dashed: true },
+    { re: /^==(?:([^=|]*)=)?=*(>)?/, thick: true },
+    { re: /^--(?:([^->|]*)-)?-*(>)?/ }
+];
+
+// A node reference at the head of `text`: an id, and the shape and label that
+// may be wrapped around it.
+function readNode(text, graph) {
+    var id = text.match(/^\s*([A-Za-z0-9_][\w.-]*)/);
+    if (!id) {
+        return null;
+    }
+    var rest = text.slice(id[0].length);
+    for (var i = 0; i < NODE_SHAPES.length; i++) {
+        var form = NODE_SHAPES[i];
+        if (rest.slice(0, form.open.length) !== form.open) {
+            continue;
+        }
+        var end = rest.indexOf(form.close, form.open.length);
+        if (end < 0) {
+            continue;
+        }
+        var label = rest.slice(form.open.length, end);
+        return {
+            node: graph.node(id[1], { text: diagramText(label) || id[1], shape: form.shape }),
+            rest: rest.slice(end + form.close.length)
+        };
+    }
+    return { node: graph.node(id[1], {}), rest: rest };
+}
+
+function readConnector(text) {
+    var trimmed = text.replace(/^\s+/, "");
+    for (var i = 0; i < CONNECTORS.length; i++) {
+        var found = trimmed.match(CONNECTORS[i].re);
+        if (!found) {
+            continue;
+        }
+        var rest = trimmed.slice(found[0].length);
+        var label = found[1] ? diagramText(found[1]) : "";
+        // `-->|yes|`, the other half of Mermaid's two ways of saying the same
+        // thing. Read here so the caller never has to know which was used.
+        var piped = rest.match(/^\s*\|([^|]*)\|/);
+        if (piped) {
+            label = diagramText(piped[1]);
+            rest = rest.slice(piped[0].length);
+        }
+        return {
+            text: label,
+            dashed: !!CONNECTORS[i].dashed,
+            thick: !!CONNECTORS[i].thick,
+            arrowEnd: !!found[2],
+            rest: rest
+        };
+    }
+    return null;
+}
+
+// `flowchart TD` and `graph LR`.
+//
+// A chain — `A --> B --> C` — is read a link at a time rather than split on the
+// connector, because a label may contain one: `A -- a --> b --> B` is two
+// links, and splitting on `-->` would make it three nodes and lose the label.
+function parseFlow(lines) {
+    var graph = new Graph();
+    for (var i = 0; i < lines.length; i++) {
+        var line = lines[i];
+        // Styling, interaction and grouping. Ignored rather than refused: a
+        // diagram that uses them should still draw, minus the colours we would
+        // not honour anyway — the editor's theme decides those.
+        if (/^(subgraph|end|style|classDef|class\s|click|linkStyle|direction)\b/i.test(line)) {
+            continue;
+        }
+        var left = readNode(line, graph);
+        if (!left || !left.node) {
+            continue;
+        }
+        var rest = left.rest;
+        var from = left.node;
+        for (;;) {
+            var link = readConnector(rest);
+            if (!link) {
+                break;
+            }
+            var right = readNode(link.rest, graph);
+            if (!right || !right.node) {
+                break;
+            }
+            graph.edge(from, right.node, link);
+            from = right.node;
+            rest = right.rest;
+        }
+    }
+    return graph;
+}
+
+// `stateDiagram-v2`. The same shape of language as a flowchart with a smaller
+// vocabulary, so it reuses the connector reader and differs in two things: the
+// label comes after a colon rather than inside the arrow, and `[*]` is the
+// start or end marker, which is drawn as a filled dot rather than as a box.
+function parseState(lines) {
+    var graph = new Graph();
+    var terminals = 0;
+    for (var i = 0; i < lines.length; i++) {
+        var line = lines[i];
+        if (/^(state\s|note\b|direction\b|classDef\b|class\s|\}|--)/i.test(line)) {
+            continue;
+        }
+        // `Still : the label`, which names a state rather than joining two.
+        var named = line.match(/^([A-Za-z0-9_][\w.-]*)\s*:\s*(.+)$/);
+        if (named && !/-{2,}>|-{2,}/.test(line)) {
+            graph.node(named[1], { text: diagramText(named[2]), shape: "rounded" });
+            continue;
+        }
+        var parts = line.split(/\s*-{2,}>\s*/);
+        if (parts.length < 2) {
+            continue;
+        }
+        // The transition's own label, which is everything after the last colon.
+        var label = "";
+        var tail = parts[parts.length - 1].match(/^([^:]*):\s*(.*)$/);
+        if (tail) {
+            parts[parts.length - 1] = tail[1];
+            label = diagramText(tail[2]);
+        }
+        var previous = null;
+        for (var p = 0; p < parts.length; p++) {
+            var name = parts[p].trim();
+            if (!name) {
+                continue;
+            }
+            var node;
+            if (name === "[*]") {
+                // Each `[*]` is its own node: one shared start-and-end state
+                // would join the beginning of the diagram to its end with an
+                // edge nobody wrote.
+                node = graph.node("__terminal" + (terminals++), { text: "", shape: "terminal" });
+            } else {
+                node = graph.node(name, { text: name, shape: "rounded" });
+            }
+            if (previous) {
+                graph.edge(previous, node, { text: p === parts.length - 1 ? label : "" });
+            }
+            previous = node;
+        }
+    }
+    return graph;
+}
+
+// The ends UML puts on a relationship, and what each is drawn as. `head` is the
+// shape at the arrow end; `line` says whether the connector itself is dashed.
+var CLASS_RELATIONS = [
+    { op: "<|..", head: "hollowTriangle", at: "from", dashed: true },
+    { op: "..|>", head: "hollowTriangle", at: "to", dashed: true },
+    { op: "<|--", head: "hollowTriangle", at: "from" },
+    { op: "--|>", head: "hollowTriangle", at: "to" },
+    { op: "*--", head: "filledDiamond", at: "from" },
+    { op: "--*", head: "filledDiamond", at: "to" },
+    { op: "o--", head: "hollowDiamond", at: "from" },
+    { op: "--o", head: "hollowDiamond", at: "to" },
+    { op: "<--", head: "arrow", at: "from" },
+    { op: "-->", head: "arrow", at: "to" },
+    { op: "<..", head: "arrow", at: "from", dashed: true },
+    { op: "..>", head: "arrow", at: "to", dashed: true },
+    { op: "--", head: null, at: null },
+    { op: "..", head: null, at: null, dashed: true }
+];
+
+// `classDiagram`.
+//
+// Two statements matter: what a class contains, and how two classes are
+// related. Members arrive either inside braces or one at a time as
+// `Animal : +String name`, and both forms are common enough in real documents
+// that supporting only one would look broken.
+function parseClass(lines) {
+    var graph = new Graph();
+    var open = null;
+    for (var i = 0; i < lines.length; i++) {
+        var line = lines[i];
+        if (open) {
+            if (/^\}/.test(line)) {
+                open = null;
+            } else {
+                addMember(open, line);
+            }
+            continue;
+        }
+        if (/^(direction|note|classDef|click|style|cssClass)\b/i.test(line)) {
+            continue;
+        }
+        var declared = line.match(/^class\s+([A-Za-z0-9_][\w.~-]*)\s*(?:\[[^\]]*\])?\s*(\{)?/i);
+        if (declared) {
+            var node = graph.node(declared[1], { text: declared[1], shape: "class" });
+            if (node && !node.members) {
+                node.members = [];
+            }
+            if (declared[2] && node) {
+                open = node;
+            }
+            continue;
+        }
+        var relation = readClassRelation(line, graph);
+        if (relation) {
+            continue;
+        }
+        // `Animal : +String name`
+        var member = line.match(/^([A-Za-z0-9_][\w.~-]*)\s*:\s*(.+)$/);
+        if (member) {
+            var owner = graph.node(member[1], { text: member[1], shape: "class" });
+            addMember(owner, member[2]);
+        }
+    }
+    return graph;
+}
+
+function addMember(node, text) {
+    if (!node) {
+        return;
+    }
+    var member = diagramText(text);
+    if (!member) {
+        return;
+    }
+    if (!node.members) {
+        node.members = [];
+    }
+    // A dozen members is a diagram; eighty is a document, and one class as tall
+    // as the whole preview tells the reader nothing.
+    if (node.members.length < 40) {
+        node.members.push(member);
+    }
+}
+
+function readClassRelation(line, graph) {
+    for (var i = 0; i < CLASS_RELATIONS.length; i++) {
+        var relation = CLASS_RELATIONS[i];
+        var at = line.indexOf(relation.op);
+        if (at <= 0) {
+            continue;
+        }
+        var left = line.slice(0, at);
+        var right = line.slice(at + relation.op.length);
+        // The label, and the cardinalities Mermaid puts in quotes either side of
+        // the operator. The quotes are dropped rather than drawn: they are the
+        // syntax, not the multiplicity.
+        var label = "";
+        var tail = right.match(/^([^:]*):\s*(.*)$/);
+        if (tail) {
+            right = tail[1];
+            label = diagramText(tail[2]);
+        }
+        var fromID = (left.replace(/"[^"]*"/g, "").trim().match(/([A-Za-z0-9_][\w.~-]*)\s*$/) || [])[1];
+        var toID = (right.replace(/"[^"]*"/g, "").trim().match(/^([A-Za-z0-9_][\w.~-]*)/) || [])[1];
+        if (!fromID || !toID) {
+            continue;
+        }
+        var from = graph.node(fromID, { text: fromID, shape: "class" });
+        var to = graph.node(toID, { text: toID, shape: "class" });
+        graph.edge(from, to, {
+            text: label,
+            dashed: !!relation.dashed,
+            arrowEnd: false,
+            headStart: relation.at === "from" ? relation.head : null,
+            headEnd: relation.at === "to" ? relation.head : null
+        });
+        return true;
+    }
+    return null;
+}
+
+// How big each node has to be to hold what is written in it.
+function sizeNodes(graph, measurer) {
+    for (var i = 0; i < graph.nodes.length; i++) {
+        var node = graph.nodes[i];
+        if (node.shape === "terminal") {
+            node.width = 18;
+            node.height = 18;
+            continue;
+        }
+        if (node.shape === "class") {
+            sizeClassNode(node, measurer);
+            continue;
+        }
+        var text = measureLines(measurer, node.text, LABEL_SIZE, false, false);
+        node.width = Math.max(MIN_NODE_WIDTH, text.width + NODE_PAD_X * 2);
+        node.height = text.height + NODE_PAD_Y * 2;
+        if (node.shape === "diamond") {
+            // A diamond only touches its label at the middle of each edge, so a
+            // box-sized one crosses the words at the corners. Widening it is
+            // what every diagramming tool does and it is cheaper than clipping
+            // the text to the rhombus.
+            node.width = node.width * 1.45;
+            node.height = node.height * 1.7;
+        } else if (node.shape === "circle") {
+            var diameter = Math.max(node.width, node.height + NODE_PAD_Y * 2);
+            node.width = diameter;
+            node.height = diameter;
+        }
+    }
+}
+
+function sizeClassNode(node, measurer) {
+    var title = measurer.size(node.text, LABEL_SIZE, true, false);
+    var width = title.width;
+    var height = title.height + NODE_PAD_Y * 2;
+    var members = node.members || [];
+    node.rows = [];
+    for (var i = 0; i < members.length; i++) {
+        var row = measurer.size(members[i], SMALL_LABEL_SIZE, false, true);
+        width = Math.max(width, row.width);
+        node.rows.push({ text: members[i], height: row.height + 4 });
+        height += row.height + 4;
+    }
+    if (members.length) {
+        height += NODE_PAD_Y;
+    }
+    node.width = Math.max(MIN_NODE_WIDTH + 40, width + NODE_PAD_X * 2);
+    node.height = height;
+    node.titleHeight = title.height + NODE_PAD_Y * 2;
+}
+
+// Which row (or column) each node belongs in.
+//
+// Longest-path layering over the edges, walked depth-first with the nodes
+// currently on the stack tracked: a cycle is normal in a state diagram and in
+// plenty of flowcharts, and an edge that closes one is simply not allowed to
+// push its target down a rank. Without that check the walk does not terminate,
+// which in a preview is the whole editor stopping on a keystroke.
+function rankNodes(graph) {
+    var outgoing = {};
+    for (var i = 0; i < graph.edges.length; i++) {
+        var edge = graph.edges[i];
+        (outgoing[edge.from] = outgoing[edge.from] || []).push(edge.to);
+    }
+    var rank = {};
+    var onStack = {};
+    var settled = {};
+
+    function visit(id, depth) {
+        if (onStack[id]) {
+            return;
+        }
+        if (settled[id] && rank[id] >= depth) {
+            return;
+        }
+        rank[id] = Math.max(rank[id] || 0, depth);
+        settled[id] = true;
+        onStack[id] = true;
+        var next = outgoing[id] || [];
+        for (var n = 0; n < next.length; n++) {
+            visit(next[n], rank[id] + 1);
+        }
+        onStack[id] = false;
+    }
+
+    // Sources first, so the ordinary diagram reads from its beginning; anything
+    // left over is in a cycle with no way in, and starts a rank of its own.
+    var hasIncoming = {};
+    for (var e = 0; e < graph.edges.length; e++) {
+        hasIncoming[graph.edges[e].to] = true;
+    }
+    for (var s = 0; s < graph.nodes.length; s++) {
+        if (!hasIncoming[graph.nodes[s].id]) {
+            visit(graph.nodes[s].id, 0);
+        }
+    }
+    for (var r = 0; r < graph.nodes.length; r++) {
+        if (!settled[graph.nodes[r].id]) {
+            visit(graph.nodes[r].id, 0);
+        }
+    }
+    for (var k = 0; k < graph.nodes.length; k++) {
+        graph.nodes[k].rank = rank[graph.nodes[k].id] || 0;
+    }
+}
+
+// Where in its rank each node sits.
+//
+// Two barycentre sweeps: each node moves to the average position of what it is
+// joined to in the rank before, then the same going back. It is the cheap half
+// of the standard algorithm and it is what stops the edges of an ordinary tree
+// crossing — the expensive half buys little on diagrams of this size and costs
+// it on every keystroke.
+function orderRanks(ranks, graph) {
+    var neighbours = {};
+    for (var i = 0; i < graph.edges.length; i++) {
+        var edge = graph.edges[i];
+        (neighbours[edge.to] = neighbours[edge.to] || []).push(edge.from);
+        (neighbours[edge.from] = neighbours[edge.from] || []).push(edge.to);
+    }
+    for (var pass = 0; pass < 2; pass++) {
+        var order = {};
+        for (var r = 0; r < ranks.length; r++) {
+            for (var n = 0; n < ranks[r].length; n++) {
+                order[ranks[r][n].id] = n;
+            }
+        }
+        for (var rank = 0; rank < ranks.length; rank++) {
+            var row = ranks[rank];
+            for (var m = 0; m < row.length; m++) {
+                var joined = neighbours[row[m].id] || [];
+                var total = 0;
+                var count = 0;
+                for (var j = 0; j < joined.length; j++) {
+                    if (order[joined[j]] !== undefined) {
+                        total += order[joined[j]];
+                        count++;
+                    }
+                }
+                // No neighbour placed yet: hold the position it came in with,
+                // rather than collapsing every such node onto zero.
+                row[m].weight = count ? total / count : m;
+            }
+            row.sort(function (a, b) {
+                return a.weight === b.weight ? a.index - b.index : a.weight - b.weight;
+            });
+        }
+    }
+}
+
+// Lays a graph out and draws it. `direction` is Mermaid's: TD and TB run down
+// the page, LR runs across, and BT and RL are those two reversed — done by
+// flipping the coordinates at the end rather than by a second layout, so there
+// is one set of arithmetic to get right instead of four.
+function layoutGraph(graph, direction, measurer, sourceOffset, label) {
+    if (!graph.nodes.length) {
+        return null;
+    }
+    sizeNodes(graph, measurer);
+    rankNodes(graph);
+
+    var ranks = [];
+    for (var i = 0; i < graph.nodes.length; i++) {
+        var node = graph.nodes[i];
+        (ranks[node.rank] = ranks[node.rank] || []).push(node);
+    }
+    for (var r = 0; r < ranks.length; r++) {
+        ranks[r] = ranks[r] || [];
+    }
+    orderRanks(ranks, graph);
+
+    var horizontal = direction === "LR" || direction === "RL";
+    // "Along" runs across a rank, "down" runs from one rank to the next. Naming
+    // them that way is what lets one pass place both directions.
+    var down = 0;
+    var extentAlong = 0;
+    for (var rank = 0; rank < ranks.length; rank++) {
+        var row = ranks[rank];
+        var thickness = 0;
+        var along = 0;
+        for (var n = 0; n < row.length; n++) {
+            var member = row[n];
+            member.along = along;
+            member.down = down;
+            along += (horizontal ? member.height : member.width) + SIBLING_GAP;
+            thickness = Math.max(thickness, horizontal ? member.width : member.height);
+        }
+        // Centred on the widest rank, which is what makes a tree look like one.
+        row.spread = along - SIBLING_GAP;
+        extentAlong = Math.max(extentAlong, row.spread);
+        down += thickness + RANK_GAP;
+    }
+    var extentDown = down - RANK_GAP;
+
+    for (var q = 0; q < ranks.length; q++) {
+        var offset = (extentAlong - ranks[q].spread) / 2;
+        for (var m = 0; m < ranks[q].length; m++) {
+            var placed = ranks[q][m];
+            if (horizontal) {
+                placed.x = placed.down;
+                placed.y = placed.along + offset;
+            } else {
+                placed.x = placed.along + offset;
+                placed.y = placed.down;
+            }
+        }
+    }
+
+    var width = horizontal ? extentDown : extentAlong;
+    var height = horizontal ? extentAlong : extentDown;
+    if (direction === "BT" || direction === "RL") {
+        for (var f = 0; f < graph.nodes.length; f++) {
+            var flipped = graph.nodes[f];
+            if (direction === "BT") {
+                flipped.y = height - flipped.y - flipped.height;
+            } else {
+                flipped.x = width - flipped.x - flipped.width;
+            }
+        }
+    }
+
+    var figure = new Figure();
+    drawEdges(figure, graph, measurer, horizontal);
+    drawNodes(figure, graph, measurer);
+    return figure.figure(width, height, label, sourceOffset);
+}
+
+function centreOf(node) {
+    return { x: node.x + node.width / 2, y: node.y + node.height / 2 };
+}
+
+// Where an edge meets a box: the point on its border in the direction of the
+// other end. Done by intersecting the centre-to-centre line with the border
+// rather than by picking a side, so a diagonal edge lands where it points
+// instead of at the middle of a face it is nowhere near.
+function borderPoint(node, towards) {
+    var centre = centreOf(node);
+    var dx = towards.x - centre.x;
+    var dy = towards.y - centre.y;
+    if (!dx && !dy) {
+        return centre;
+    }
+    var halfWidth = node.width / 2;
+    var halfHeight = node.height / 2;
+    var scale;
+    if (Math.abs(dx) * halfHeight > Math.abs(dy) * halfWidth) {
+        scale = halfWidth / Math.abs(dx);
+    } else {
+        scale = halfHeight / Math.abs(dy);
+    }
+    return { x: centre.x + dx * scale, y: centre.y + dy * scale };
+}
+
+function drawEdges(figure, graph, measurer, horizontal) {
+    for (var i = 0; i < graph.edges.length; i++) {
+        var edge = graph.edges[i];
+        var from = graph.byID[edge.from];
+        var to = graph.byID[edge.to];
+        if (!from || !to || from === to) {
+            // A self-edge has nowhere to go in a layered layout; it is dropped
+            // rather than drawn as a line from a box to itself, which is a dot.
+            continue;
+        }
+        var start = borderPoint(from, centreOf(to));
+        var end = borderPoint(to, centreOf(from));
+        var points = elbow(start, end, horizontal);
+        var head = edge.headEnd || (edge.arrowEnd ? "arrow" : null);
+        var tail = edge.headStart || (edge.arrowStart ? "arrow" : null);
+        // A shape at the end needs the line to stop short of it, or the stroke
+        // shows through a hollow head as a line drawn across it.
+        if (head && head !== "arrow") {
+            points[points.length - 1] = backOff(points[points.length - 1],
+                                                points[points.length - 2], headLength(head));
+        }
+        if (tail && tail !== "arrow") {
+            points[0] = backOff(points[0], points[1], headLength(tail));
+        }
+        figure.line(points, {
+            stroke: "foreground",
+            strokeWidth: edge.thick ? 2.2 : 1.3,
+            dashed: edge.dashed,
+            arrowEnd: head === "arrow",
+            arrowStart: tail === "arrow"
+        });
+        if (head && head !== "arrow") {
+            drawHead(figure, head, end, points[points.length - 2]);
+        }
+        if (tail && tail !== "arrow") {
+            drawHead(figure, tail, start, points[1]);
+        }
+        if (edge.text) {
+            var middle = points[Math.floor(points.length / 2)];
+            var previous = points[Math.floor(points.length / 2) - 1] || points[0];
+            figure.edgeLabel(measurer, edge.text,
+                             (middle.x + previous.x) / 2, (middle.y + previous.y) / 2);
+        }
+    }
+}
+
+// Two straight segments joined at a right angle when the ends do not line up.
+// A single diagonal across three ranks reads as a line to somewhere else; the
+// elbow is what makes it obvious which two boxes an edge joins.
+function elbow(start, end, horizontal) {
+    var slack = 2;
+    if (Math.abs(start.x - end.x) < slack || Math.abs(start.y - end.y) < slack) {
+        return [start, end];
+    }
+    if (horizontal) {
+        var midX = (start.x + end.x) / 2;
+        return [start, { x: midX, y: start.y }, { x: midX, y: end.y }, end];
+    }
+    var midY = (start.y + end.y) / 2;
+    return [start, { x: start.x, y: midY }, { x: end.x, y: midY }, end];
+}
+
+function headLength(head) {
+    return head === "hollowTriangle" ? 11 : 13;
+}
+
+function backOff(tip, from, distance) {
+    var dx = tip.x - from.x;
+    var dy = tip.y - from.y;
+    var length = Math.sqrt(dx * dx + dy * dy) || 1;
+    return { x: tip.x - (dx / length) * distance, y: tip.y - (dy / length) * distance };
+}
+
+// UML's ends, as closed polygons. A hollow one is filled with the page rather
+// than left empty, which is what hides the edge behind it.
+function drawHead(figure, kind, tip, from) {
+    var dx = tip.x - from.x;
+    var dy = tip.y - from.y;
+    var length = Math.sqrt(dx * dx + dy * dy) || 1;
+    var ux = dx / length;
+    var uy = dy / length;
+    var size = headLength(kind);
+    var half = size * 0.42;
+    var base = { x: tip.x - ux * size, y: tip.y - uy * size };
+    var left = { x: base.x - uy * half, y: base.y + ux * half };
+    var right = { x: base.x + uy * half, y: base.y - ux * half };
+    if (kind === "hollowTriangle") {
+        figure.line([tip, left, right], {
+            closed: true, fill: "background", stroke: "foreground", strokeWidth: 1.3
+        });
+        return;
+    }
+    var back = { x: tip.x - ux * size * 2, y: tip.y - uy * size * 2 };
+    figure.line([tip, left, back, right], {
+        closed: true,
+        fill: kind === "filledDiamond" ? "foreground" : "background",
+        stroke: "foreground",
+        strokeWidth: 1.3
+    });
+}
+
+function drawNodes(figure, graph, measurer) {
+    for (var i = 0; i < graph.nodes.length; i++) {
+        var node = graph.nodes[i];
+        var centre = centreOf(node);
+        switch (node.shape) {
+        case "terminal":
+            figure.box(node.x, node.y, node.width, node.height,
+                       { ellipse: true, fill: "foreground", stroke: "foreground" });
+            break;
+        case "circle":
+            figure.box(node.x, node.y, node.width, node.height, { ellipse: true });
+            drawLines(figure, measurer, node.text, centre.x, centre.y, {});
+            break;
+        case "stadium":
+            figure.box(node.x, node.y, node.width, node.height, { radius: node.height / 2 });
+            drawLines(figure, measurer, node.text, centre.x, centre.y, {});
+            break;
+        case "rounded":
+            figure.box(node.x, node.y, node.width, node.height, { radius: 8 });
+            drawLines(figure, measurer, node.text, centre.x, centre.y, {});
+            break;
+        case "diamond":
+            figure.line([
+                { x: centre.x, y: node.y },
+                { x: node.x + node.width, y: centre.y },
+                { x: centre.x, y: node.y + node.height },
+                { x: node.x, y: centre.y }
+            ], { closed: true, fill: "surface", stroke: "border", strokeWidth: 1 });
+            drawLines(figure, measurer, node.text, centre.x, centre.y, {});
+            break;
+        case "hexagon":
+            var inset = Math.min(16, node.width / 4);
+            figure.line([
+                { x: node.x + inset, y: node.y },
+                { x: node.x + node.width - inset, y: node.y },
+                { x: node.x + node.width, y: centre.y },
+                { x: node.x + node.width - inset, y: node.y + node.height },
+                { x: node.x + inset, y: node.y + node.height },
+                { x: node.x, y: centre.y }
+            ], { closed: true, fill: "surface", stroke: "border", strokeWidth: 1 });
+            drawLines(figure, measurer, node.text, centre.x, centre.y, {});
+            break;
+        case "subroutine":
+            figure.box(node.x, node.y, node.width, node.height, {});
+            figure.line([{ x: node.x + 6, y: node.y }, { x: node.x + 6, y: node.y + node.height }],
+                        { stroke: "border" });
+            figure.line([{ x: node.x + node.width - 6, y: node.y },
+                         { x: node.x + node.width - 6, y: node.y + node.height }],
+                        { stroke: "border" });
+            drawLines(figure, measurer, node.text, centre.x, centre.y, {});
+            break;
+        case "class":
+            drawClassNode(figure, measurer, node);
+            break;
+        default:
+            figure.box(node.x, node.y, node.width, node.height, { radius: 3 });
+            drawLines(figure, measurer, node.text, centre.x, centre.y, {});
+            break;
+        }
+    }
+}
+
+// A class: a name, a rule, and its members in a monospaced column. Left-aligned
+// under a centred name, which is how UML sets one and how the eye finds the
+// member it is looking for.
+function drawClassNode(figure, measurer, node) {
+    figure.box(node.x, node.y, node.width, node.height, {});
+    figure.label(node.text, node.x + node.width / 2, node.y + node.titleHeight / 2,
+                 { bold: true });
+    var rows = node.rows || [];
+    if (!rows.length) {
+        return;
+    }
+    var y = node.y + node.titleHeight;
+    figure.line([{ x: node.x, y: y }, { x: node.x + node.width, y: y }], { stroke: "border" });
+    y += NODE_PAD_Y / 2;
+    for (var i = 0; i < rows.length; i++) {
+        figure.label(rows[i].text, node.x + NODE_PAD_X, y + rows[i].height / 2,
+                     { size: SMALL_LABEL_SIZE, mono: true, align: "leading" });
+        y += rows[i].height;
+    }
+}
+
+// `sequenceDiagram`.
+//
+// The one kind here that is not a graph: participants are a fixed row across the
+// top and time runs down the page, so the layered layout above has nothing to
+// offer it and it gets a pass of its own. What it shares is everything below the
+// waist — the same Figure, the same measurer, the same inks.
+function parseSequence(lines) {
+    var diagram = { participants: [], byID: {}, steps: [] };
+
+    function participant(name, label) {
+        var id = String(name).trim();
+        if (!id) {
+            return null;
+        }
+        var existing = diagram.byID[id];
+        if (existing) {
+            if (label) {
+                existing.text = label;
+            }
+            return existing;
+        }
+        if (diagram.participants.length >= DIAGRAM_MAX_NODES) {
+            return null;
+        }
+        var made = { id: id, text: label || id, index: diagram.participants.length };
+        diagram.participants.push(made);
+        diagram.byID[id] = made;
+        return made;
+    }
+
+    for (var i = 0; i < lines.length; i++) {
+        var line = lines[i];
+        var declared = line.match(/^(?:participant|actor)\s+([^\s:]+)(?:\s+as\s+(.+))?$/i);
+        if (declared) {
+            participant(declared[1], declared[2] ? diagramText(declared[2]) : "");
+            continue;
+        }
+        var note = line.match(/^note\s+(?:(over)\s+([^:]+)|(?:left|right)\s+of\s+([^:]+)):\s*(.*)$/i);
+        if (note) {
+            var over = (note[2] || note[3] || "").split(",").map(function (name) {
+                return participant(name.trim(), "");
+            });
+            diagram.steps.push({ kind: "note", over: over, text: diagramText(note[4]) });
+            continue;
+        }
+        // Blocks — loop, alt, opt, par — are not drawn. Their *contents* are, so
+        // a diagram using them still reads as a sequence of messages rather than
+        // disappearing; §6 records the frame as missing.
+        if (/^(loop|alt|else|opt|par|and|rect|activate|deactivate|end|autonumber|box)\b/i.test(line)) {
+            continue;
+        }
+        var message = line.match(/^([^\s:>-]+)\s*(-?->>?|-\)|--\))\s*([^\s:]+)\s*:\s*(.*)$/);
+        if (!message) {
+            continue;
+        }
+        var from = participant(message[1], "");
+        var to = participant(message[3], "");
+        if (!from || !to || diagram.steps.length >= DIAGRAM_MAX_EDGES) {
+            continue;
+        }
+        diagram.steps.push({
+            kind: "message", from: from, to: to,
+            text: diagramText(message[4]),
+            dashed: message[2].indexOf("--") === 0
+        });
+    }
+    return diagram;
+}
+
+var SEQUENCE_GAP = 34;
+var SEQUENCE_STEP = 38;
+var SELF_MESSAGE_DROP = 26;
+
+function layoutSequence(diagram, measurer, sourceOffset) {
+    if (!diagram.participants.length || !diagram.steps.length) {
+        return null;
+    }
+    // Each participant is as wide as its own name, and at least as wide as the
+    // longest message it sends: a heading narrower than the arrow under it
+    // leaves the label overhanging the lifeline it belongs to.
+    var widest = 0;
+    for (var s = 0; s < diagram.steps.length; s++) {
+        var step = diagram.steps[s];
+        if (step.text) {
+            widest = Math.max(widest,
+                              measurer.size(step.text, SMALL_LABEL_SIZE, false, false).width);
+        }
+    }
+    var headHeight = 0;
+    var x = 0;
+    for (var p = 0; p < diagram.participants.length; p++) {
+        var person = diagram.participants[p];
+        var name = measureLines(measurer, person.text, LABEL_SIZE, true, false);
+        person.width = Math.max(MIN_NODE_WIDTH + 20, name.width + NODE_PAD_X * 2);
+        person.height = name.height + NODE_PAD_Y * 2;
+        headHeight = Math.max(headHeight, person.height);
+        person.x = x;
+        x += person.width + Math.max(SEQUENCE_GAP, widest / 2);
+    }
+    var width = x - Math.max(SEQUENCE_GAP, widest / 2);
+
+    var figure = new Figure();
+    var top = headHeight;
+    var y = top + 18;
+    var steps = [];
+    for (var i = 0; i < diagram.steps.length; i++) {
+        var entry = diagram.steps[i];
+        entry.y = y;
+        steps.push(entry);
+        if (entry.kind === "message" && entry.from === entry.to) {
+            y += SEQUENCE_STEP + SELF_MESSAGE_DROP;
+        } else if (entry.kind === "note") {
+            y += SEQUENCE_STEP + 8;
+        } else {
+            y += SEQUENCE_STEP;
+        }
+    }
+    var height = y;
+
+    // Lifelines first: everything else is drawn over them.
+    for (var l = 0; l < diagram.participants.length; l++) {
+        var line = diagram.participants[l];
+        var centre = line.x + line.width / 2;
+        figure.line([{ x: centre, y: top }, { x: centre, y: height - 10 }],
+                    { stroke: "border", dashed: true });
+    }
+    for (var h = 0; h < diagram.participants.length; h++) {
+        var head = diagram.participants[h];
+        figure.box(head.x, (headHeight - head.height) / 2, head.width, head.height,
+                   { radius: 4 });
+        drawLines(figure, measurer, head.text, head.x + head.width / 2, headHeight / 2,
+                  { bold: true });
+    }
+
+    for (var m = 0; m < steps.length; m++) {
+        drawSequenceStep(figure, measurer, steps[m], width);
+    }
+    return figure.figure(width, height, "Sequence diagram", sourceOffset);
+}
+
+function lifelineX(person) {
+    return person.x + person.width / 2;
+}
+
+function drawSequenceStep(figure, measurer, step, width) {
+    if (step.kind === "note") {
+        var over = (step.over || []).filter(Boolean);
+        var left = over.length ? lifelineX(over[0]) - 60 : 0;
+        var right = over.length ? lifelineX(over[over.length - 1]) + 60 : width;
+        var size = measureLines(measurer, step.text, SMALL_LABEL_SIZE, false, false);
+        var noteWidth = Math.max(size.width + NODE_PAD_X * 2, right - left);
+        figure.box(left, step.y - size.height / 2 - 6, noteWidth, size.height + 12,
+                   { fill: "background", stroke: "border", dashed: true, radius: 2 });
+        drawLines(figure, measurer, step.text, left + noteWidth / 2, step.y,
+                  { size: SMALL_LABEL_SIZE, ink: "secondary" });
+        return;
+    }
+    var fromX = lifelineX(step.from);
+    var toX = lifelineX(step.to);
+    if (step.from === step.to) {
+        // A message to itself: out, down and back, which is the only way to draw
+        // one that does not end where it started.
+        var out = fromX + 46;
+        figure.line([
+            { x: fromX, y: step.y },
+            { x: out, y: step.y },
+            { x: out, y: step.y + SELF_MESSAGE_DROP },
+            { x: fromX, y: step.y + SELF_MESSAGE_DROP }
+        ], { stroke: "foreground", strokeWidth: 1.3, dashed: step.dashed, arrowEnd: true });
+        if (step.text) {
+            figure.label(step.text, out + 10, step.y + SELF_MESSAGE_DROP / 2,
+                         { size: SMALL_LABEL_SIZE, align: "leading", ink: "secondary" });
+        }
+        return;
+    }
+    figure.line([{ x: fromX, y: step.y }, { x: toX, y: step.y }],
+                { stroke: "foreground", strokeWidth: 1.3, dashed: step.dashed, arrowEnd: true });
+    if (step.text) {
+        // Above the arrow rather than on it: a sequence diagram is read down the
+        // page, and a label boxed into the line breaks that column of arrows.
+        figure.label(step.text, (fromX + toX) / 2, step.y - 9,
+                     { size: SMALL_LABEL_SIZE, ink: "secondary" });
+    }
+}
+
+
+// A file that is nothing but a diagram. The same engine, given the whole buffer
+// instead of a fence, so `.mmd` next to a README renders the same way the fence
+// in the README does — and a file that does not parse says so as a heading
+// rather than drawing an empty page.
+function renderMermaid(text) {
+    if (text.length > PREVIEW_LIMIT) {
+        return tooLarge(text);
+    }
+    var drawn = renderDiagram(text, 0);
+    if (drawn) {
+        return [drawn];
+    }
+    return [
+        { type: "heading", level: 3, spans: [span("Not a diagram this preview can draw", {})],
+          source: 0 },
+        { type: "paragraph", source: 0, spans: [span(
+            "Supported: flowchart, graph, classDiagram, stateDiagram-v2 and sequenceDiagram.",
+            {})] },
+        { type: "code", text: String(text), language: "mermaid", source: 0 }
+    ];
+}
+
+linelark.addPreview({
+    id: "mermaid",
+    title: "Diagram",
+    extensions: ["mmd", "mermaid"],
+    languages: ["mermaid"],
+    render: renderMermaid
+});
 
 linelark.addPreview({
     id: "markdown",

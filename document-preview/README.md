@@ -1,10 +1,11 @@
 # Document Preview
 
-Renders the Markdown or HTML file you are looking at, in place of its source.
+Renders the Markdown or HTML file you are looking at, in place of its source, and draws the
+Mermaid diagrams in it.
 
-Open a `.md` or `.html` file and press **Preview** in the toolbar (⇧⌘V, also View ▸ Preview).
-The pane swaps to the rendering; press it again and the source comes back, at the line you
-were reading. The button is dim for anything this plugin does not claim.
+Open a `.md`, `.html` or `.mmd` file and press **Preview** in the toolbar (⇧⌘V, also
+View ▸ Preview). The pane swaps to the rendering; press it again and the source comes back,
+at the line you were reading. The button is dim for anything this plugin does not claim.
 
 ## What it shows
 
@@ -70,6 +71,46 @@ A useful check on all of this: run a Markdown file through `marked.parse` and pr
 HTML that comes out. The editor's own README gives 80 blocks either way, with the same prose
 in the same order.
 
+## Diagrams
+
+A ```` ```mermaid ```` fence in a Markdown file is drawn rather than shown as source, and a
+`.mmd` file is drawn as a whole. Four kinds: `flowchart` / `graph`, `classDiagram`,
+`stateDiagram-v2` and `sequenceDiagram`.
+
+**Linelark does not know what any of it means.** The editor draws boxes, ellipses,
+polylines, closed polygons and labels in a coordinate space this plugin chooses — there is
+no `class`, no `lifeline` and no `association` on its side of the API. Parsing *and layout*
+are here, which is what makes a diagram language a plugin release rather than an editor
+release, and it is the only shape the feature could take: previews have no WebView to hand
+an SVG to and fetch no images, in either edition.
+
+**Layout needs a font, so the host lends one.** `linelark.measureText(text, {size, bold,
+mono})` answers with the same `NSFont` the editor will paint with. Guessing a box's size
+from a character count is wrong for every proportional font and wrong by a different amount
+per string — and it fails by putting a label just outside the box it names, which reads as a
+bug in the editor rather than in the plugin.
+
+**Colour is a role, never a colour.** A shape asks for `surface`, `border`, `foreground`,
+`accent`, `background` and so on, and the editor's theme decides what those are, so one
+diagram is two drawings in a light and a dark theme. `background` is the one opaque light
+role and it is what knocks the edge out from under a label and fills a hollow UML arrowhead;
+`surface` is a translucent overlay and would let the line show through both.
+
+What it does **not** do, and each is where a diagram will look plainer than Mermaid's own:
+
+- **No subgraphs, and no `alt`/`loop`/`opt` frames.** Their contents are drawn, the box
+  around them is not, so a diagram that uses them still reads rather than disappearing.
+- **No styling.** `style`, `classDef`, `linkStyle` and `click` are ignored: the editor's
+  theme decides colours, and a click target in a preview would be a link the plugin invented.
+- **No cardinalities on class relations**, and no `<<interface>>` stereotypes.
+- **Layered layout only**, with two barycentre sweeps to keep the edges of an ordinary tree
+  from crossing. Edges route as one elbow; a self-edge in a flowchart is dropped rather than
+  drawn as a dot, though a self-*message* in a sequence diagram is drawn properly.
+- **Capped** at 240 nodes, 480 edges and 1200 lines. Past any of them the fence is shown as
+  source, because unrendered and readable beats half-rendered and wrong. The same is true of
+  a header this version has never heard of — a diagram written for a newer Mermaid comes out
+  as its own text rather than as an empty box.
+
 ## What neither does
 
 - **No images.** An image is drawn as its alt text. A preview node describes text, and
@@ -92,5 +133,9 @@ rather than imported.
 
 ## API used
 
-`addPreview`, twice. The preview nodes it returns: `heading`, `paragraph`, `code`, `quote`,
-`list` (ordered, unordered and task items, with nested children), `table`, `rule`.
+`addPreview`, three times — Markdown, HTML and Mermaid — and `linelark.measureText` for
+diagram layout. The preview nodes it returns: `heading`, `paragraph`, `code`, `quote`,
+`list` (ordered, unordered and task items, with nested children), `table`, `rule`, and
+`figure` with `box`, `ellipse`, `line` (open, closed and filled) and `label` shapes.
+
+Needs API generation 9, which is where `figure` and `measureText` arrive.
