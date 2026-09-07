@@ -1,11 +1,11 @@
 {
   "id": "com.linelark.example.documentpreview",
   "name": "Document Preview",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "apiVersion": 9,
   "minimumAppVersion": "1.10.0",
   "main": "main.js",
   "author": "Linelark",
-  "description": "Renders Markdown and HTML in place of their source, draws Mermaid diagrams — flowchart, class, state and sequence — and keeps your place across the switch.",
+  "description": "Renders Markdown and HTML in place of their source, draws Mermaid and PlantUML diagrams, and keeps your place across the switch.",
   "pricing": "free"
 }

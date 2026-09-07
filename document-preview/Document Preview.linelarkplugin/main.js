@@ -239,11 +239,9 @@ function mdBlock(token, source) {
         // it can be: an unknown header, a diagram past its caps, or one that
         // parses to nothing all fall through to the code block, which is
         // readable and honest about not having been rendered.
-        if (/^mermaid$/i.test(language)) {
-            var drawn = renderDiagram(token.text, source);
-            if (drawn) {
-                return drawn;
-            }
+        var drawn = renderFencedDiagram(language, token.text, source);
+        if (drawn) {
+            return drawn;
         }
         return { type: "code", text: token.text, language: language, source: source };
     case "blockquote":
@@ -1408,6 +1406,9 @@ function readClassRelation(line, graph) {
 function sizeNodes(graph, measurer) {
     for (var i = 0; i < graph.nodes.length; i++) {
         var node = graph.nodes[i];
+        if (node.virtual) {
+            continue;
+        }
         if (node.shape === "terminal") {
             node.width = 18;
             node.height = 18;
@@ -1439,6 +1440,12 @@ function sizeClassNode(node, measurer) {
     var title = measurer.size(node.text, LABEL_SIZE, true, false);
     var width = title.width;
     var height = title.height + NODE_PAD_Y * 2;
+    if (node.stereotype) {
+        var mark = measurer.size(node.stereotype, SMALL_LABEL_SIZE, false, false);
+        width = Math.max(width, mark.width);
+        height += mark.height;
+        node.stereotypeHeight = mark.height;
+    }
     var members = node.members || [];
     node.rows = [];
     for (var i = 0; i < members.length; i++) {
@@ -1452,7 +1459,7 @@ function sizeClassNode(node, measurer) {
     }
     node.width = Math.max(MIN_NODE_WIDTH + 40, width + NODE_PAD_X * 2);
     node.height = height;
-    node.titleHeight = title.height + NODE_PAD_Y * 2;
+    node.titleHeight = title.height + NODE_PAD_Y * 2 + (node.stereotypeHeight || 0);
 }
 
 // Which row (or column) each node belongs in.
@@ -1517,10 +1524,60 @@ function rankNodes(graph) {
 // of the standard algorithm and it is what stops the edges of an ordinary tree
 // crossing — the expensive half buys little on diagrams of this size and costs
 // it on every keystroke.
-function orderRanks(ranks, graph) {
-    var neighbours = {};
+// Gives every edge that spans more than one rank somewhere to *be* in the ranks
+// it crosses.
+//
+// Without this an edge is a line from one box to another straight over whatever
+// stands between them, and in a diagram as small as four classes it already
+// happens: an aggregation from a base class to a leaf ran through the middle of
+// the subclass between them. The standard answer is a node per crossed rank that
+// occupies a lane and is never drawn — the edge is then routed through the
+// corridor those reserve, and, because they take part in the ordering pass, a
+// long edge also pulls the boxes either side of it into line.
+function expandEdges(graph) {
+    var segments = [];
+    var routes = [];
+    var virtuals = 0;
     for (var i = 0; i < graph.edges.length; i++) {
         var edge = graph.edges[i];
+        var from = graph.byID[edge.from];
+        var to = graph.byID[edge.to];
+        routes.push([]);
+        if (!from || !to || from === to) {
+            continue;
+        }
+        var step = to.rank > from.rank ? 1 : -1;
+        var span = Math.abs(to.rank - from.rank);
+        if (span < 2) {
+            segments.push({ from: edge.from, to: edge.to });
+            continue;
+        }
+        var previous = from.id;
+        for (var rank = from.rank + step; rank !== to.rank; rank += step) {
+            var waypoint = {
+                id: "__waypoint" + (virtuals++),
+                text: "", shape: "waypoint", virtual: true,
+                rank: rank, index: graph.nodes.length,
+                width: 18, height: 1
+            };
+            graph.nodes.push(waypoint);
+            graph.byID[waypoint.id] = waypoint;
+            routes[i].push(waypoint);
+            segments.push({ from: previous, to: waypoint.id });
+            previous = waypoint.id;
+        }
+        segments.push({ from: previous, to: edge.to });
+    }
+    // `segments` is what the ordering pass walks — a long edge as the chain of
+    // short ones it has become — and `routes` is what the drawing walks, one
+    // list of waypoints per original edge.
+    return { segments: segments, routes: routes };
+}
+
+function orderRanks(ranks, segments) {
+    var neighbours = {};
+    for (var i = 0; i < segments.length; i++) {
+        var edge = segments[i];
         (neighbours[edge.to] = neighbours[edge.to] || []).push(edge.from);
         (neighbours[edge.from] = neighbours[edge.from] || []).push(edge.to);
     }
@@ -1564,6 +1621,7 @@ function layoutGraph(graph, direction, measurer, sourceOffset, label) {
     }
     sizeNodes(graph, measurer);
     rankNodes(graph);
+    var expanded = expandEdges(graph);
 
     var ranks = [];
     for (var i = 0; i < graph.nodes.length; i++) {
@@ -1573,7 +1631,7 @@ function layoutGraph(graph, direction, measurer, sourceOffset, label) {
     for (var r = 0; r < ranks.length; r++) {
         ranks[r] = ranks[r] || [];
     }
-    orderRanks(ranks, graph);
+    orderRanks(ranks, expanded.segments);
 
     var horizontal = direction === "LR" || direction === "RL";
     // "Along" runs across a rank, "down" runs from one rank to the next. Naming
@@ -1626,7 +1684,7 @@ function layoutGraph(graph, direction, measurer, sourceOffset, label) {
     }
 
     var figure = new Figure();
-    drawEdges(figure, graph, measurer, horizontal);
+    drawEdges(figure, graph, measurer, horizontal, expanded.routes);
     drawNodes(figure, graph, measurer);
     return figure.figure(width, height, label, sourceOffset);
 }
@@ -1657,7 +1715,7 @@ function borderPoint(node, towards) {
     return { x: centre.x + dx * scale, y: centre.y + dy * scale };
 }
 
-function drawEdges(figure, graph, measurer, horizontal) {
+function drawEdges(figure, graph, measurer, horizontal, routes) {
     for (var i = 0; i < graph.edges.length; i++) {
         var edge = graph.edges[i];
         var from = graph.byID[edge.from];
@@ -1667,9 +1725,17 @@ function drawEdges(figure, graph, measurer, horizontal) {
             // rather than drawn as a line from a box to itself, which is a dot.
             continue;
         }
-        var start = borderPoint(from, centreOf(to));
-        var end = borderPoint(to, centreOf(from));
-        var points = elbow(start, end, horizontal);
+        var waypoints = ((routes && routes[i]) || []).map(centreOf);
+        var start = borderPoint(from, waypoints.length ? waypoints[0] : centreOf(to));
+        var end = borderPoint(to, waypoints.length
+            ? waypoints[waypoints.length - 1] : centreOf(from));
+        // An edge with waypoints is already going somewhere deliberate — through
+        // the corridor they reserved — so it is drawn as the polyline it is. The
+        // elbow is for the short edge with nothing between its ends, where a
+        // diagonal reads as a line to somewhere else.
+        var points = waypoints.length
+            ? [start].concat(waypoints, [end])
+            : elbow(start, end, horizontal);
         var head = edge.headEnd || (edge.arrowEnd ? "arrow" : null);
         var tail = edge.headStart || (edge.arrowStart ? "arrow" : null);
         // A shape at the end needs the line to stop short of it, or the stroke
@@ -1761,6 +1827,9 @@ function drawHead(figure, kind, tip, from) {
 function drawNodes(figure, graph, measurer) {
     for (var i = 0; i < graph.nodes.length; i++) {
         var node = graph.nodes[i];
+        if (node.virtual) {
+            continue;
+        }
         var centre = centreOf(node);
         switch (node.shape) {
         case "terminal":
@@ -1825,8 +1894,19 @@ function drawNodes(figure, graph, measurer) {
 // member it is looking for.
 function drawClassNode(figure, measurer, node) {
     figure.box(node.x, node.y, node.width, node.height, {});
-    figure.label(node.text, node.x + node.width / 2, node.y + node.titleHeight / 2,
-                 { bold: true });
+    if (node.stereotype) {
+        // Above the name and set smaller, which is how UML says "this box is an
+        // interface" when the box itself is the same box as a class's.
+        var middle = node.y + NODE_PAD_Y + node.stereotypeHeight / 2;
+        figure.label(node.stereotype, node.x + node.width / 2, middle,
+                     { size: SMALL_LABEL_SIZE, italic: true, ink: "secondary" });
+        figure.label(node.text, node.x + node.width / 2,
+                     node.y + node.stereotypeHeight + (node.titleHeight - node.stereotypeHeight) / 2,
+                     { bold: true });
+    } else {
+        figure.label(node.text, node.x + node.width / 2, node.y + node.titleHeight / 2,
+                     { bold: true });
+    }
     var rows = node.rows || [];
     if (!rows.length) {
         return;
@@ -1847,28 +1927,44 @@ function drawClassNode(figure, measurer, node) {
 // top and time runs down the page, so the layered layout above has nothing to
 // offer it and it gets a pass of its own. What it shares is everything below the
 // waist — the same Figure, the same measurer, the same inks.
+// The participants and the messages between them, in order. A type of its own
+// because two languages fill it: Mermaid's `sequenceDiagram` and PlantUML's
+// arrows, which differ in every character of their syntax and in none of what
+// they mean.
+function SequenceDiagram() {
+    this.participants = [];
+    this.byID = {};
+    this.steps = [];
+}
+
+SequenceDiagram.prototype.participant = function (name, label) {
+    var id = String(name == null ? "" : name).trim();
+    if (!id) {
+        return null;
+    }
+    var existing = this.byID[id];
+    if (existing) {
+        // A name declared after it was first used keeps the declaration, which
+        // is how `participant A as Alice` reads however far down it is written.
+        if (label) {
+            existing.text = label;
+        }
+        return existing;
+    }
+    if (this.participants.length >= DIAGRAM_MAX_NODES) {
+        return null;
+    }
+    var made = { id: id, text: label || id, index: this.participants.length };
+    this.participants.push(made);
+    this.byID[id] = made;
+    return made;
+};
+
 function parseSequence(lines) {
-    var diagram = { participants: [], byID: {}, steps: [] };
+    var diagram = new SequenceDiagram();
 
     function participant(name, label) {
-        var id = String(name).trim();
-        if (!id) {
-            return null;
-        }
-        var existing = diagram.byID[id];
-        if (existing) {
-            if (label) {
-                existing.text = label;
-            }
-            return existing;
-        }
-        if (diagram.participants.length >= DIAGRAM_MAX_NODES) {
-            return null;
-        }
-        var made = { id: id, text: label || id, index: diagram.participants.length };
-        diagram.participants.push(made);
-        diagram.byID[id] = made;
-        return made;
+        return diagram.participant(name, label);
     }
 
     for (var i = 0; i < lines.length; i++) {
@@ -2027,6 +2123,286 @@ function drawSequenceStep(figure, measurer, step, width) {
 }
 
 
+// ---------------------------------------------------------------------------
+// PlantUML
+//
+// The same figures from a different language, and no editor work at all: it
+// produces the Graph and SequenceDiagram the Mermaid side already builds, and
+// everything from layout down is shared. What is genuinely different is that
+// PlantUML does not say what kind of diagram it is — Mermaid's first word does,
+// and here it has to be worked out from the statements.
+// ---------------------------------------------------------------------------
+
+// Directives, styling and the parts of the language that describe a picture we
+// do not draw. Skipped rather than refused: a file full of `skinparam` should
+// still show its classes, minus the colours the editor's theme decides anyway.
+var PLANT_IGNORED = /^(@start\w*|@end\w*|skinparam|skin\b|!|title\b|header\b|footer\b|legend\b|end\s?legend|hide\b|show\b|scale\b|caption\b|autonumber\b|activate\b|deactivate\b|destroy\b|newpage\b|allow_mixing\b|left\s+to\s+right\b|top\s+to\s+bottom\b|together\b|package\b|namespace\b|node\b|folder\b|frame\b|database\b|rectangle\b|card\b)/i;
+
+// The block-shaped keywords. Their *contents* are drawn and their frames are
+// not, so a diagram using them reads as what it is rather than disappearing.
+var PLANT_BLOCKS = /^(alt|else|opt|loop|par|group|critical|break|ref|box|end\b|end$|\}|\{)/i;
+
+// A relation's length and direction are hints about layout, not about meaning:
+// `-up->` and `---->` are `-->` with an opinion about where to put the boxes.
+// Normalising them away is what lets one table of operators serve both
+// languages, since the remainder is Mermaid's exactly.
+function plantNormalizeArrows(line) {
+    return line
+        .replace(/-(?:up|down|left|right|u|d|l|r)-(?=[->|.*o])/gi, "-")
+        .replace(/-(?:up|down|left|right|u|d|l|r)->/gi, "-->")
+        .replace(/-{3,}/g, "--")
+        .replace(/\.{3,}/g, "..");
+}
+
+// PlantUML comments: `'` to the end of a line, and `/' … '/` across them.
+function plantLines(source) {
+    var withoutBlocks = String(source).replace(/\/'[\s\S]*?'\//g, " ");
+    var lines = [];
+    var raw = withoutBlocks.split(/\r\n|\r|\n/);
+    for (var i = 0; i < raw.length && lines.length <= DIAGRAM_MAX_LINES; i++) {
+        var line = raw[i].replace(/^\s*'.*$/, "").trim();
+        if (line) {
+            lines.push(line);
+        }
+    }
+    return lines;
+}
+
+// Which kind of diagram this is, decided by what the file actually contains.
+//
+// Order matters and is not arbitrary. A class declaration or a UML relation end
+// is unambiguous, so it wins. A message with a colon after an arrow is a
+// sequence — and has to be tested before the state rules, because `A -> B : x`
+// would otherwise read as a transition between two states. `[*]` is a state
+// diagram's start marker and nothing else uses it. What is left, if it has
+// arrows at all, is drawn as a graph: an activity or state diagram written
+// without either marker still reads as boxes joined by lines.
+function plantKind(lines) {
+    var arrows = false;
+    for (var i = 0; i < lines.length; i++) {
+        var line = lines[i];
+        if (/^(abstract\s+class|abstract|class|interface|enum|entity|struct|protocol|annotation)\s+\S/i.test(line)) {
+            return "class";
+        }
+        if (/(<\|--|<\|\.\.|--\|>|\.\.\|>|\*--|--\*|o--|--o)/.test(line)) {
+            return "class";
+        }
+        if (/^[^:]*(<-|->|-->|<--|->>|<<-)[^:]*:/.test(line)) {
+            return "sequence";
+        }
+        if (/\[\*\]/.test(line) || /^state\s+\S/i.test(line)) {
+            return "state";
+        }
+        if (/(-->|->)/.test(line)) {
+            arrows = true;
+        }
+    }
+    return arrows ? "state" : null;
+}
+
+function renderPlantDiagram(source, sourceOffset) {
+    var lines = plantLines(source);
+    if (!lines.length || lines.length > DIAGRAM_MAX_LINES) {
+        return null;
+    }
+    var body = [];
+    for (var i = 0; i < lines.length; i++) {
+        if (!PLANT_IGNORED.test(lines[i])) {
+            body.push(lines[i]);
+        }
+    }
+    var measurer = new Measurer();
+    switch (plantKind(body)) {
+    case "class":
+        return layoutGraph(parsePlantClass(body), "TD", measurer, sourceOffset, "Class diagram");
+    case "sequence":
+        return layoutSequence(parsePlantSequence(body), measurer, sourceOffset);
+    case "state":
+        return layoutGraph(parsePlantState(body), "TD", measurer, sourceOffset, "State diagram");
+    default:
+        return null;
+    }
+}
+
+// A class diagram. The relation operators are Mermaid's own once the direction
+// hints are normalised away, so `readClassRelation` does that half unchanged;
+// what differs is the declaration syntax and the stereotypes.
+function parsePlantClass(lines) {
+    var graph = new Graph();
+    var open = null;
+    for (var i = 0; i < lines.length; i++) {
+        var line = plantNormalizeArrows(lines[i]);
+        if (open) {
+            if (/^\}/.test(line)) {
+                open = null;
+            } else {
+                addMember(open, plantMember(line));
+            }
+            continue;
+        }
+        var declared = line.match(
+            /^(?:abstract\s+)?(class|interface|enum|entity|struct|protocol|annotation)\s+("[^"]+"|[\w.$]+)(?:\s+as\s+([\w.$]+))?[^{]*?(\{)?\s*$/i);
+        if (declared) {
+            var name = diagramText(declared[2]);
+            var alias = declared[3] || name;
+            var node = graph.node(alias, { text: name, shape: "class" });
+            if (node && !node.members) {
+                node.members = [];
+            }
+            // A stereotype is what tells an interface from a class when both are
+            // drawn as the same box, and PlantUML's own rendering says it the
+            // same way.
+            if (node && /^(interface|enum|annotation)$/i.test(declared[1])
+                && node.members.length === 0) {
+                node.stereotype = "<<" + declared[1].toLowerCase() + ">>";
+            }
+            if (declared[4] && node) {
+                open = node;
+            }
+            continue;
+        }
+        if (readClassRelation(line, graph)) {
+            continue;
+        }
+        // `Animal : +String name`, the one-at-a-time form.
+        var member = line.match(/^([\w.$]+)\s*:\s*(.+)$/);
+        if (member) {
+            addMember(graph.node(member[1], { text: member[1], shape: "class" }),
+                      plantMember(member[2]));
+        }
+    }
+    return graph;
+}
+
+// A member line, with the parts that are about drawing taken off: PlantUML's
+// visibility sigils are `+ - # ~`, which are UML's own and are kept, but its
+// `{static}` and `{abstract}` modifiers are formatting instructions and go.
+function plantMember(text) {
+    return diagramText(String(text).replace(/\{(static|abstract|field|method)\}/gi, "").trim());
+}
+
+// A sequence diagram. PlantUML's arrows carry their meaning in punctuation —
+// dashes for a dotted line, the head's direction in which end the `<` is on —
+// and a message is anything with a colon after one.
+function parsePlantSequence(lines) {
+    var diagram = new SequenceDiagram();
+    for (var i = 0; i < lines.length; i++) {
+        var line = lines[i];
+        var declared = line.match(
+            /^(?:participant|actor|boundary|control|entity|database|collections|queue)\s+("[^"]+"|[\w.$]+)(?:\s+as\s+("[^"]+"|[\w.$]+))?/i);
+        if (declared) {
+            // `participant Alice as A` names the thing first and the handle
+            // second, which is the opposite way round from Mermaid.
+            var first = diagramText(declared[1]);
+            if (declared[2]) {
+                diagram.participant(diagramText(declared[2]), first);
+            } else {
+                diagram.participant(first, first);
+            }
+            continue;
+        }
+        var note = line.match(/^(?:h?note)\s+(?:(over)\s+([^:]+)|(?:left|right)\s+of\s+([^:]+)):\s*(.*)$/i);
+        if (note) {
+            var over = (note[2] || note[3] || "").split(",").map(function (name) {
+                return diagram.participant(name.trim().replace(/^"|"$/g, ""), "");
+            });
+            diagram.steps.push({ kind: "note", over: over, text: diagramText(note[4]) });
+            continue;
+        }
+        if (PLANT_BLOCKS.test(line)) {
+            continue;
+        }
+        var message = line.match(
+            /^("[^"]+"|[\w.$]+)\s*(<?-{1,2}>?>?|<<?-{1,2})\s*("[^"]+"|[\w.$]+)\s*:\s*(.*)$/);
+        if (!message || !/[<>]/.test(message[2])) {
+            continue;
+        }
+        var arrow = message[2];
+        var left = diagram.participant(diagramText(message[1]), "");
+        var right = diagram.participant(diagramText(message[3]), "");
+        if (!left || !right || diagram.steps.length >= DIAGRAM_MAX_EDGES) {
+            continue;
+        }
+        // `B <- A` is `A -> B` written backwards, and drawing it as it is
+        // written would point the arrow at the sender.
+        var backwards = arrow.charAt(0) === "<";
+        diagram.steps.push({
+            kind: "message",
+            from: backwards ? right : left,
+            to: backwards ? left : right,
+            text: diagramText(message[4]),
+            dashed: arrow.indexOf("--") >= 0
+        });
+    }
+    return diagram;
+}
+
+// A state or activity diagram: `[*]`, states, and the transitions between them.
+function parsePlantState(lines) {
+    var graph = new Graph();
+    var terminals = 0;
+
+    function state(name) {
+        var id = String(name).trim().replace(/^"|"$/g, "");
+        if (id === "[*]") {
+            // One per marker, or the start of the diagram would be joined to its
+            // end by an edge nobody wrote.
+            return graph.node("__terminal" + (terminals++), { text: "", shape: "terminal" });
+        }
+        return graph.node(id, { text: id, shape: "rounded" });
+    }
+
+    for (var i = 0; i < lines.length; i++) {
+        var line = plantNormalizeArrows(lines[i]);
+        var declared = line.match(/^state\s+("[^"]+"|[\w.$]+)(?:\s+as\s+([\w.$]+))?/i);
+        if (declared && !/-->/.test(line)) {
+            var name = diagramText(declared[1]);
+            graph.node(declared[2] || name, { text: name, shape: "rounded" });
+            continue;
+        }
+        if (PLANT_BLOCKS.test(line)) {
+            continue;
+        }
+        var parts = line.split(/\s*-->\s*/);
+        if (parts.length < 2) {
+            continue;
+        }
+        var label = "";
+        var tail = parts[parts.length - 1].match(/^([^:]*):\s*(.*)$/);
+        if (tail) {
+            parts[parts.length - 1] = tail[1];
+            label = diagramText(tail[2]);
+        }
+        var previous = null;
+        for (var p = 0; p < parts.length; p++) {
+            var text = parts[p].trim();
+            if (!text) {
+                continue;
+            }
+            var node = state(text);
+            if (previous) {
+                graph.edge(previous, node, { text: p === parts.length - 1 ? label : "" });
+            }
+            previous = node;
+        }
+    }
+    return graph;
+}
+
+// A fenced block that is a picture rather than code. Which language it names
+// decides which parser reads it, and either may decline — an unknown header, a
+// diagram past its caps, or one that parses to nothing all fall through to the
+// code block, which is readable and honest about not having been rendered.
+function renderFencedDiagram(language, text, source) {
+    if (/^mermaid$/i.test(language)) {
+        return renderDiagram(text, source);
+    }
+    if (/^(plantuml|puml|uml)$/i.test(language)) {
+        return renderPlantDiagram(text, source);
+    }
+    return null;
+}
+
 // A file that is nothing but a diagram. The same engine, given the whole buffer
 // instead of a fence, so `.mmd` next to a README renders the same way the fence
 // in the README does — and a file that does not parse says so as a heading
@@ -2048,6 +2424,32 @@ function renderMermaid(text) {
         { type: "code", text: String(text), language: "mermaid", source: 0 }
     ];
 }
+
+function renderPlantUML(text) {
+    if (text.length > PREVIEW_LIMIT) {
+        return tooLarge(text);
+    }
+    var drawn = renderPlantDiagram(text, 0);
+    if (drawn) {
+        return [drawn];
+    }
+    return [
+        { type: "heading", level: 3, spans: [span("Not a diagram this preview can draw", {})],
+          source: 0 },
+        { type: "paragraph", source: 0, spans: [span(
+            "Supported: class, sequence and state diagrams. Deployment, component, timing "
+            + "and the rest come out as their own source.", {})] },
+        { type: "code", text: String(text), language: "plantuml", source: 0 }
+    ];
+}
+
+linelark.addPreview({
+    id: "plantuml",
+    title: "Diagram",
+    extensions: ["puml", "plantuml", "pu", "iuml", "wsd"],
+    languages: ["plantuml"],
+    render: renderPlantUML
+});
 
 linelark.addPreview({
     id: "mermaid",

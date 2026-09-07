@@ -1,9 +1,9 @@
 # Document Preview
 
 Renders the Markdown or HTML file you are looking at, in place of its source, and draws the
-Mermaid diagrams in it.
+Mermaid and PlantUML diagrams in it.
 
-Open a `.md`, `.html` or `.mmd` file and press **Preview** in the toolbar (⇧⌘V, also
+Open a `.md`, `.html`, `.mmd` or `.puml` file and press **Preview** in the toolbar (⇧⌘V, also
 View ▸ Preview). The pane swaps to the rendering; press it again and the source comes back,
 at the line you were reading. The button is dim for anything this plugin does not claim.
 
@@ -73,9 +73,19 @@ in the same order.
 
 ## Diagrams
 
-A ```` ```mermaid ```` fence in a Markdown file is drawn rather than shown as source, and a
-`.mmd` file is drawn as a whole. Four kinds: `flowchart` / `graph`, `classDiagram`,
-`stateDiagram-v2` and `sequenceDiagram`.
+A ```` ```mermaid ```` or ```` ```plantuml ```` fence in a Markdown file is drawn rather than
+shown as source, and a `.mmd` or `.puml` file is drawn as a whole.
+
+**Mermaid**: `flowchart` / `graph`, `classDiagram`, `stateDiagram-v2`, `sequenceDiagram`.
+
+**PlantUML**: class, sequence and state diagrams, between `@startuml` and `@enduml`.
+PlantUML does not announce which kind it is — Mermaid's first word does — so it is worked out
+from the statements: a `class` declaration or a UML relation end settles it, then a message
+with a colon after an arrow, then `[*]` or `state`. What is left, if it has arrows at all, is
+drawn as a graph, so an activity diagram written without either marker still reads as boxes
+joined by lines. Direction hints (`-up->`, `---->`) are opinions about layout rather than
+about meaning, so they are normalised away and the operators that remain are Mermaid's
+exactly — one table of relation ends serves both languages.
 
 **Linelark does not know what any of it means.** The editor draws boxes, ellipses,
 polylines, closed polygons and labels in a coordinate space this plugin chooses — there is
@@ -98,8 +108,10 @@ role and it is what knocks the edge out from under a label and fills a hollow UM
 
 What it does **not** do, and each is where a diagram will look plainer than Mermaid's own:
 
-- **No subgraphs, and no `alt`/`loop`/`opt` frames.** Their contents are drawn, the box
+- **No subgraphs, packages, or `alt`/`loop`/`opt` frames.** Their contents are drawn, the box
   around them is not, so a diagram that uses them still reads rather than disappearing.
+- **PlantUML's other diagram kinds** — deployment, component, timing, mind map, JSON — come
+  out as their own source. So does `skinparam`, along with every other styling directive.
 - **No styling.** `style`, `classDef`, `linkStyle` and `click` are ignored: the editor's
   theme decides colours, and a click target in a preview would be a link the plugin invented.
 - **No cardinalities on class relations**, and no `<<interface>>` stereotypes.
@@ -133,8 +145,8 @@ rather than imported.
 
 ## API used
 
-`addPreview`, three times — Markdown, HTML and Mermaid — and `linelark.measureText` for
-diagram layout. The preview nodes it returns: `heading`, `paragraph`, `code`, `quote`,
+`addPreview`, four times — Markdown, HTML, Mermaid and PlantUML — and `linelark.measureText`
+for diagram layout. The preview nodes it returns: `heading`, `paragraph`, `code`, `quote`,
 `list` (ordered, unordered and task items, with nested children), `table`, `rule`, and
 `figure` with `box`, `ellipse`, `line` (open, closed and filled) and `label` shapes.
 
