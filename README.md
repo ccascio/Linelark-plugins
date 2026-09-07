@@ -2,6 +2,10 @@
 
 Example plugins for [Linelark](https://linelark.com), written to be read and copied.
 
+<https://github.com/ccascio/Linelark-plugins> — start from any of these. They are MIT
+licensed and none of them is a special case: what they use is the same documented API any
+plugin has, and the full guide is at <https://linelark.com/plugins/>.
+
 A plugin is a folder, a `manifest.json`, and a JavaScript file. No build step, no
 toolchain, no compiled binary — Linelark evaluates plugins with JavaScriptCore, the engine
 already in macOS. Each plugin runs in its own context with its own globals, so two plugins

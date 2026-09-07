@@ -5,7 +5,10 @@ Guidance for Claude Code working in this repository.
 ## What this is
 
 Example plugins for [Linelark](https://linelark.com), a macOS editor whose source is a
-sibling checkout at `../Notepad4MacOS`. They are **not shipped with the app** and are not
+sibling checkout at `../Notepad4MacOS`. This repository is public
+(<https://github.com/ccascio/Linelark-plugins>) and the editor's own README and the
+developer guide on the site both link to it, so a change here is a change to what people
+are told to copy from. They are **not shipped with the app** and are not
 loaded from its source tree.
 
 **Nothing here verifies them.** There is no build, no test suite, and the editor's own tests
