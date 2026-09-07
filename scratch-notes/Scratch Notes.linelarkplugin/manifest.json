@@ -3,6 +3,7 @@
   "name": "Scratch Notes",
   "version": "2.0.1",
   "apiVersion": 3,
+  "minimumAppVersion": "1.3.0",
   "main": "main.js",
   "author": "Linelark",
   "description": "A scratchpad that belongs to the file you are looking at: notes pinned to a line, saved as you type, and brought back when you return to them.",

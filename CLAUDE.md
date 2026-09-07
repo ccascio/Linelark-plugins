@@ -115,7 +115,18 @@ Generation 5 covers `addContextMenuItem`. Generation 6 covers remote management
 (`repoAddRemoteAsync`, `repoSetRemoteURLAsync`, `repoRemoveRemoteAsync`) plus
 `openPluginSettings` and `openURL`. Generation 7 covers `setSecret` and `clearSecret`. Generation 8 covers
 `workspaceFolders()` and `repoSelectFolder(path)` — which project in a multi-root workspace
-the git calls are about.
+the git calls are about. Generation 9 covers the `figure` preview node — a diagram the plugin
+lays out itself — and `measureText`, which is what makes laying one out possible.
+
+**`minimumAppVersion` is what the catalog says out loud.** `apiVersion` is the gate: the host
+compares it against its own generation and refuses what it cannot load. But a number is not
+something to put in front of a reader, so the catalog needs the *release* that first spoke
+that generation — "Needs Linelark 1.3.0" rather than "needs API generation 5" — and the
+plugin is what states it. Required by `plugins:check` for anything past generation 2, as
+three numbers. It used to be a table in the website's publish script, which made that
+repository the authority on the editor's generations and meant every bump in the app blocked
+publishing here until someone edited it. Nothing is gated on the value, which is what makes
+stating it here safe: the worst a wrong one does is name the wrong release in that sentence.
 
 ```json
 {
@@ -123,6 +134,7 @@ the git calls are about.
   "name": "Thing",
   "version": "1.0.0",
   "apiVersion": 1,
+  "minimumAppVersion": "1.3.0",
   "git": "write",
   "hosts": ["api.example.com"],
   "secrets": [

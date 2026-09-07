@@ -3,6 +3,7 @@
   "name": "GitHub",
   "version": "2.4.0",
   "apiVersion": 8,
+  "minimumAppVersion": "1.7.0",
   "main": "main.js",
   "author": "Linelark",
   "description": "A git client in the side panel: pick which project in the workspace it acts on, stage, commit, manage remotes, pull, push, and read diffs — plus browser sign-in to GitHub, pull requests, checks, and repository links.",

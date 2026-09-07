@@ -54,8 +54,10 @@ timers and promises, and the limits worth knowing before designing around them â
 
 `apiVersion` 1 for most of these. `scratch-notes` and `story-bible` need 3 for the plugin
 store and autosaving fields; `compare-files` needs 4 for merge callbacks in `openDiff`;
-`github` needs 8 to say which project in a multi-root workspace its git actions are about.
-An older host refuses to load them and says so. Git is Studio-only: the sandbox blocks subprocesses, so the App Store edition
+`github` needs 8 to say which project in a multi-root workspace its git actions are about;
+`document-preview` needs 9 to draw a diagram it has laid out itself. An older host refuses to
+load them and says so, and each manifest carries the `minimumAppVersion` that turns its
+generation into a release a reader can act on. Git is Studio-only: the sandbox blocks subprocesses, so the App Store edition
 does not ship the git reader at all and `repoIsAvailable()` answers `false` there. A plugin
 that uses it should check and explain itself rather than showing an empty panel.
 

@@ -3,6 +3,7 @@
   "name": "Format",
   "version": "1.0.0",
   "apiVersion": 5,
+  "minimumAppVersion": "1.3.0",
   "main": "main.js",
   "author": "Linelark",
   "description": "Formats JSON, XML, HTML and CSS exactly — values, strings and text are copied through untouched — and reindents or tidies whitespace in every other language.",
