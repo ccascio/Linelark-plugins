@@ -73,7 +73,7 @@ which is in the reflog like any other.
 
 ## Licence
 
-MIT. Copy from these freely.
+MIT — see [LICENSE](LICENSE). Copy from these freely.
 
 `document-preview` also contains [marked](https://github.com/markedjs/marked) v15.0.7,
 copyright (c) 2011-2025 Christopher Jeffrey, likewise MIT. Its HTML parser is our own.
