@@ -1,9 +1,9 @@
 # Document Preview
 
 Renders the Markdown or HTML file you are looking at, in place of its source, and draws the
-Mermaid and PlantUML diagrams in it.
+Mermaid, PlantUML and draw.io diagrams in it.
 
-Open a `.md`, `.html`, `.mmd` or `.puml` file and press **Preview** in the toolbar (⇧⌘V, also
+Open a `.md`, `.html`, `.mmd`, `.puml` or `.drawio` file and press **Preview** in the toolbar (⇧⌘V, also
 View ▸ Preview). The pane swaps to the rendering; press it again and the source comes back,
 at the line you were reading. The button is dim for anything this plugin does not claim.
 
@@ -17,9 +17,11 @@ them. That is what keeps a preview on the editor's theme, and it is why a previe
 script or pull a remote stylesheet: there is no HTML anywhere in this, not even in the HTML
 preview.
 
-**Two previews, one plugin.** `addPreview` is called twice, so a `.md` file offers "Preview
-as Markdown" and a `.html` file "Preview as HTML" — the title is what the button says. They
-share the entity decoder, the span helpers and the size limit; only the parser differs.
+**Five previews, one plugin.** `addPreview` is called five times, so a `.md` file offers
+"Preview as Markdown", a `.html` file "Preview as HTML", and a `.mmd`, `.puml` or `.drawio`
+file "Preview as Diagram" — the title is what the button says. They share the entity decoder,
+the span helpers, the size limit and, between the three diagram readers, the whole figure
+toolkit; only the parser differs.
 
 **Every block says where it came from.** `source` is the offset in the file the block was
 built from, and it is what keeps your place across the switch. In HTML that is exact at
@@ -78,6 +80,21 @@ shown as source, and a `.mmd` or `.puml` file is drawn as a whole.
 
 **Mermaid**: `flowchart` / `graph`, `classDiagram`, `stateDiagram-v2`, `sequenceDiagram`.
 
+**draw.io**: a `.drawio` file, every page of it. This one is not like the other two, and the
+difference is worth stating: Mermaid and PlantUML say what connects to what and leave the
+placing to the plugin, while a `.drawio` file says where every box *is*, because somebody
+dragged it there. So there is no layout step at all — the geometry is read and painted, and
+the arrangement that survives is the author's own, waypoints and all.
+
+What cannot survive is the colour. A `figure` names meanings rather than colours, which is
+what stops a diagram being invisible on somebody's background, so each fill is read as the
+meaning it was probably chosen for: green as `positive`, red as `negative`, amber as
+`warning`, blue as `accent`, anything too pale or too grey as a plain surface. A diagram that
+used colour decoratively comes out quieter than it went in; one that used it to say something
+keeps what it was saying. Shapes it does not know — draw.io ships hundreds of stencils —
+are drawn as labelled rectangles rather than skipped, because a box in the right place still
+says what is connected to what, and skipping it would lose the edges into it too.
+
 **PlantUML**: class, sequence and state diagrams, between `@startuml` and `@enduml`.
 PlantUML does not announce which kind it is — Mermaid's first word does — so it is worked out
 from the statements: a `class` declaration or a UML relation end settles it, then a message
@@ -123,6 +140,31 @@ What it does **not** do, and each is where a diagram will look plainer than Merm
   a header this version has never heard of — a diagram written for a newer Mermaid comes out
   as its own text rather than as an empty box.
 
+## What draw.io does not get
+
+- **Compressed pages are not drawn.** draw.io can deflate a page into base64 instead of
+  writing its XML, and this reads XML. The preview says which switch turns it off — File ▸
+  Properties ▸ Compressed — rather than showing an empty page. Files written by current
+  draw.io are uncompressed; none of the 90 real files this was built against was compressed.
+- **Colour is a meaning, not a colour** — see above. Five meanings and a surface is the whole
+  palette a preview node has.
+- **Stencils are rectangles.** Cylinders, actors, lifelines, notes, documents, hexagons,
+  rhombuses, processes and swimlanes are drawn as themselves; a network switch from a stencil
+  library is a labelled box.
+- **An edge label goes where the file says, or out of the way.** A label somebody dragged
+  keeps the position draw.io stored for it. A label an edge carries in its own `value` has no
+  stored position and defaults to the middle of the line — which in a crowded diagram is
+  often on top of a box the line passes behind, and the patch of page that keeps the line out
+  of the words would then erase that box's text. So the middle is tried first and then points
+  either side of it, and the first one clear of every node wins. What counts as a node is
+  geometric: a shape with others inside it is a region, whether or not the file makes it
+  their parent, because plenty of diagrams draw the backdrop as an ordinary rectangle with
+  everything laid on top.
+- **Rich text inside a label is flattened.** `<b>`, `<i>` and the rest are stripped; `<br>`
+  and `</div>` become line breaks. A box's *style* can still say bold or italic, and that is
+  honoured — it is markup inside the words that is lost.
+- **Capped** at 900 cells and 12 pages.
+
 ## What neither does
 
 - **No images.** An image is drawn as its alt text. A preview node describes text, and
@@ -145,8 +187,8 @@ rather than imported.
 
 ## API used
 
-`addPreview`, four times — Markdown, HTML, Mermaid and PlantUML — and `linelark.measureText`
-for diagram layout. The preview nodes it returns: `heading`, `paragraph`, `code`, `quote`,
+`addPreview`, five times — Markdown, HTML, Mermaid, PlantUML and draw.io — and
+`linelark.measureText` for diagram layout. The preview nodes it returns: `heading`, `paragraph`, `code`, `quote`,
 `list` (ordered, unordered and task items, with nested children), `table`, `rule`, and
 `figure` with `box`, `ellipse`, `line` (open, closed and filled) and `label` shapes.
 

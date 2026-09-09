@@ -2393,6 +2393,828 @@ function parsePlantState(lines) {
 // decides which parser reads it, and either may decline — an unknown header, a
 // diagram past its caps, or one that parses to nothing all fall through to the
 // code block, which is readable and honest about not having been rendered.
+// MARK: - draw.io
+//
+// A `.drawio` file is the one diagram here that arrives already laid out. Mermaid and
+// PlantUML say what connects to what and leave the placing to us; draw.io says where every
+// box *is*, because somebody dragged it there. So this half of the plugin has no layout at
+// all — it reads geometry and paints it, and the reason it is worth having is that the
+// arrangement is the author's own and should survive being read in an editor.
+//
+// **What cannot survive is the colour.** A figure names meanings — `accent`, `positive`,
+// `negative` — and the theme owns the palette, which is what stops a diagram being
+// invisible on somebody's background. draw.io files carry real hex fills, so they are read
+// as the meaning they were probably chosen for: green for good, red for bad, amber for a
+// warning, blue for emphasis, everything else for a plain surface. A diagram that used
+// colour decoratively comes out quieter than it went in; one that used it to say something
+// keeps what it was saying.
+
+var DRAWIO_MAX_CELLS = 900;
+var DRAWIO_MAX_PAGES = 12;
+// A canvas is measured in the file's own points, and pages are commonly 1600 wide. The
+// preview scales a figure down to the pane, so a big diagram is small rather than cut off —
+// but past a point the words in it stop being words, and a cap that says so is better than
+// one that draws a grey smudge.
+var DRAWIO_MAX_SPAN = 12000;
+
+// A minimal XML reader, for this format rather than for XML.
+//
+// The HTML parser above cannot serve: it knows void elements, implied ends and raw-text
+// tags, none of which exist here, and it drops `<svg>` and friends — where `<mxCell>` would
+// simply be an unknown tag. This wants the opposite of tolerance: a fixed, machine-written
+// vocabulary read exactly, and anything it does not understand left alone.
+function xmlParse(text) {
+    var root = { tag: "#root", attrs: {}, children: [], text: "" };
+    var stack = [root];
+    var pattern = /<!--[\s\S]*?-->|<!\[CDATA\[([\s\S]*?)\]\]>|<\?[\s\S]*?\?>|<!DOCTYPE[^>]*>|<\/([A-Za-z_][\w.:-]*)\s*>|<([A-Za-z_][\w.:-]*)((?:"[^"]*"|'[^']*'|[^>"'])*)>/g;
+    var at = 0;
+    var match;
+    var guard = 0;
+    while ((match = pattern.exec(text)) !== null) {
+        if (++guard > 200000) {
+            return null;
+        }
+        var top = stack[stack.length - 1];
+        // Whatever sat between the last tag and this one belongs to the element holding it.
+        // Only `<diagram>` ever has any, and there it is the compressed payload.
+        if (match.index > at) {
+            top.text += text.slice(at, match.index);
+        }
+        at = pattern.lastIndex;
+        if (match[1] !== undefined) {
+            top.text += match[1];
+            continue;
+        }
+        if (match[2] !== undefined) {
+            // A stray close tag closes nothing rather than unwinding the whole document.
+            for (var up = stack.length - 1; up > 0; up--) {
+                if (stack[up].tag === match[2]) {
+                    stack.length = up;
+                    break;
+                }
+            }
+            continue;
+        }
+        if (match[3] === undefined) {
+            continue;
+        }
+        var raw = match[4] || "";
+        var node = { tag: match[3], attrs: xmlAttributes(raw), children: [], text: "" };
+        top.children.push(node);
+        if (!/\/\s*$/.test(raw)) {
+            stack.push(node);
+            if (stack.length > 64) {
+                return null;
+            }
+        }
+    }
+    return root;
+}
+
+var XML_ATTR = /([A-Za-z_][\w.:-]*)\s*=\s*("[^"]*"|'[^']*')/g;
+
+function xmlAttributes(raw) {
+    var attrs = {};
+    var match;
+    XML_ATTR.lastIndex = 0;
+    while ((match = XML_ATTR.exec(raw)) !== null) {
+        attrs[match[1]] = decode(match[2].slice(1, -1));
+    }
+    return attrs;
+}
+
+function xmlFind(node, tag, out) {
+    out = out || [];
+    for (var i = 0; i < node.children.length; i++) {
+        var child = node.children[i];
+        if (child.tag === tag) {
+            out.push(child);
+        }
+        xmlFind(child, tag, out);
+    }
+    return out;
+}
+
+// `key=value;flag;key=value` — draw.io's own style language. A bare word is a flag, and the
+// first one is usually the shape: `ellipse;whiteSpace=wrap` is an ellipse.
+function drawioStyle(text) {
+    var style = { _first: "" };
+    var parts = String(text || "").split(";");
+    for (var i = 0; i < parts.length; i++) {
+        var part = parts[i].trim();
+        if (!part) {
+            continue;
+        }
+        var cut = part.indexOf("=");
+        if (cut === -1) {
+            style[part.toLowerCase()] = true;
+            if (!style._first) {
+                style._first = part.toLowerCase();
+            }
+        } else {
+            style[part.slice(0, cut).trim().toLowerCase()] = part.slice(cut + 1).trim();
+        }
+    }
+    return style;
+}
+
+// A cell's label. draw.io writes rich text into it when `html=1`, which is most of the time,
+// so the tags have to come out — and `<br>` and `</div>` are line breaks rather than
+// nothing, which is the difference between a three-line box and one very wide line.
+function drawioLabel(value) {
+    var text = String(value == null ? "" : value);
+    if (!text) {
+        return "";
+    }
+    text = text.replace(/<br\s*\/?>/gi, "\n")
+        .replace(/<\/(div|p|li|h[1-6])>/gi, "\n")
+        .replace(/<li\b[^>]*>/gi, "• ")
+        .replace(/<[^>]*>/g, "");
+    return decode(text).replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
+}
+
+// What a fill was probably *for*.
+//
+// Hue rather than a table of draw.io's swatches: the defaults are the common case but
+// nothing stops somebody picking their own green, and a green nobody listed should still
+// read as one. Anything too pale or too grey to carry a meaning is a plain surface.
+function drawioInk(colour, fallback) {
+    var text = String(colour || "").trim().toLowerCase();
+    if (!text || text === "none") {
+        return text === "none" ? "none" : fallback;
+    }
+    var hex = text.match(/^#?([0-9a-f]{6})$/);
+    if (!hex) {
+        return fallback;
+    }
+    var value = parseInt(hex[1], 16);
+    var r = ((value >> 16) & 255) / 255;
+    var g = ((value >> 8) & 255) / 255;
+    var b = (value & 255) / 255;
+    var max = Math.max(r, g, b);
+    var min = Math.min(r, g, b);
+    var delta = max - min;
+    if (delta < 0.06) {
+        return "surface";
+    }
+    var hue;
+    if (max === r) {
+        hue = 60 * (((g - b) / delta) % 6);
+    } else if (max === g) {
+        hue = 60 * ((b - r) / delta + 2);
+    } else {
+        hue = 60 * ((r - g) / delta + 4);
+    }
+    if (hue < 0) {
+        hue += 360;
+    }
+    if (hue < 20 || hue >= 330) {
+        return "negative";
+    }
+    if (hue < 65) {
+        return "warning";
+    }
+    if (hue < 170) {
+        return "positive";
+    }
+    if (hue < 280) {
+        return "accent";
+    }
+    return "surface";
+}
+
+// One page's cells, read out of its `<mxGraphModel>`.
+//
+// `<object>` and `<UserObject>` wrap a cell to hang custom properties on it, and when they
+// do, the *label* is theirs rather than the cell's. Reading only `<mxCell>` loses the text
+// of every box in a file that uses them, which looks like a diagram of empty rectangles.
+function drawioCells(model) {
+    var cells = [];
+    var byID = {};
+    var wrappers = xmlFind(model, "object").concat(xmlFind(model, "UserObject"));
+    var labelled = {};
+    for (var w = 0; w < wrappers.length; w++) {
+        var inner = wrappers[w].children.filter(function (child) { return child.tag === "mxCell"; })[0];
+        if (inner) {
+            labelled[wrappers[w].attrs.id || ""] = wrappers[w];
+            inner.attrs.id = inner.attrs.id || wrappers[w].attrs.id;
+            inner.attrs.value = wrappers[w].attrs.label != null
+                ? wrappers[w].attrs.label : inner.attrs.value;
+        }
+    }
+    var found = xmlFind(model, "mxCell");
+    for (var i = 0; i < found.length && cells.length < DRAWIO_MAX_CELLS; i++) {
+        var node = found[i];
+        var attrs = node.attrs;
+        var geometry = node.children.filter(function (child) { return child.tag === "mxGeometry"; })[0];
+        var cell = {
+            id: attrs.id || ("cell" + i),
+            parent: attrs.parent || "",
+            value: attrs.value || "",
+            style: drawioStyle(attrs.style),
+            isVertex: attrs.vertex === "1",
+            isEdge: attrs.edge === "1",
+            source: attrs.source || "",
+            target: attrs.target || "",
+            x: 0, y: 0, width: 0, height: 0,
+            relative: false,
+            points: [],
+            sourcePoint: null,
+            targetPoint: null,
+            offset: null
+        };
+        if (geometry) {
+            cell.x = drawioNumber(geometry.attrs.x);
+            cell.y = drawioNumber(geometry.attrs.y);
+            cell.width = drawioNumber(geometry.attrs.width);
+            cell.height = drawioNumber(geometry.attrs.height);
+            cell.relative = geometry.attrs.relative === "1";
+            for (var g = 0; g < geometry.children.length; g++) {
+                var part = geometry.children[g];
+                if (part.tag === "Array" && part.attrs.as === "points") {
+                    for (var p = 0; p < part.children.length; p++) {
+                        if (part.children[p].tag === "mxPoint") {
+                            cell.points.push({ x: drawioNumber(part.children[p].attrs.x),
+                                               y: drawioNumber(part.children[p].attrs.y) });
+                        }
+                    }
+                } else if (part.tag === "mxPoint") {
+                    if (part.attrs.as === "sourcePoint") {
+                        cell.sourcePoint = { x: drawioNumber(part.attrs.x), y: drawioNumber(part.attrs.y) };
+                    } else if (part.attrs.as === "targetPoint") {
+                        cell.targetPoint = { x: drawioNumber(part.attrs.x), y: drawioNumber(part.attrs.y) };
+                    } else if (part.attrs.as === "offset") {
+                        cell.offset = { x: drawioNumber(part.attrs.x), y: drawioNumber(part.attrs.y) };
+                    }
+                }
+            }
+        }
+        cells.push(cell);
+        byID[cell.id] = cell;
+    }
+    return { cells: cells, byID: byID };
+}
+
+function drawioNumber(text) {
+    var value = parseFloat(text);
+    return isFinite(value) ? value : 0;
+}
+
+// Where each box actually is on the page.
+//
+// A cell inside a container — a swimlane, a group — is positioned relative to that
+// container's own corner, so the coordinate in the file is not the coordinate on the page.
+// Walking the parent chain is the whole of it, with a depth cap because a malformed file can
+// name a parent that names it back.
+function drawioPlace(model) {
+    var byID = model.byID;
+    for (var i = 0; i < model.cells.length; i++) {
+        var cell = model.cells[i];
+        cell.ax = cell.x;
+        cell.ay = cell.y;
+        if (!cell.isVertex) {
+            continue;
+        }
+        var parent = byID[cell.parent];
+        var depth = 0;
+        while (parent && parent.isVertex && depth++ < 16) {
+            cell.ax += parent.x;
+            cell.ay += parent.y;
+            parent = byID[parent.parent];
+        }
+    }
+}
+
+// The centre of a cell, and the point on its border facing somewhere else. An edge that
+// stopped at the centre would be drawn under the box it points at.
+function drawioCentre(cell) {
+    return { x: cell.ax + cell.width / 2, y: cell.ay + cell.height / 2 };
+}
+
+function drawioBorder(cell, towards) {
+    var centre = drawioCentre(cell);
+    var dx = towards.x - centre.x;
+    var dy = towards.y - centre.y;
+    if (!dx && !dy) {
+        return centre;
+    }
+    var halfW = Math.max(cell.width / 2, 1);
+    var halfH = Math.max(cell.height / 2, 1);
+    var scale = Math.min(halfW / Math.abs(dx || 0.0001), halfH / Math.abs(dy || 0.0001));
+    return { x: centre.x + dx * scale, y: centre.y + dy * scale };
+}
+
+// The shapes draw.io files here actually contain, plus a fallback that is never nothing.
+//
+// An unknown shape is drawn as a plain box rather than skipped: draw.io ships hundreds of
+// stencil libraries and this will never know them all, but a labelled rectangle where a
+// network switch should be still says what is connected to what — which is what somebody
+// reading a diagram in an editor came for. Skipping it loses a node and the edges into it.
+function drawioVertexShape(figure, cell) {
+    var style = cell.style;
+    var shape = String(style.shape || style._first || "").toLowerCase();
+    var x = cell.ax;
+    var y = cell.ay;
+    var w = cell.width;
+    var h = cell.height;
+    var fill = drawioInk(style.fillcolor, "surface");
+    var stroke = drawioInk(style.strokecolor, "border");
+    var dashed = style.dashed === "1";
+    var thick = drawioNumber(style.strokewidth) > 1.5 ? 2 : 1;
+    var options = { fill: fill, stroke: stroke, dashed: dashed, strokeWidth: thick };
+
+    // A label with no box around it. Drawn as nothing here; the text pass puts the words in.
+    if (shape === "text" || style.text === true) {
+        return;
+    }
+    if (shape === "ellipse" || style.ellipse === true) {
+        figure.box(x, y, w, h, { fill: fill, stroke: stroke, dashed: dashed,
+                                 strokeWidth: thick, ellipse: true });
+        return;
+    }
+    if (shape === "rhombus" || style.rhombus === true) {
+        figure.line([{ x: x + w / 2, y: y }, { x: x + w, y: y + h / 2 },
+                     { x: x + w / 2, y: y + h }, { x: x, y: y + h / 2 }],
+                    { closed: true, fill: fill, stroke: stroke, dashed: dashed });
+        return;
+    }
+    if (shape === "hexagon") {
+        var inset = Math.min(w / 4, h / 2);
+        figure.line([{ x: x + inset, y: y }, { x: x + w - inset, y: y },
+                     { x: x + w, y: y + h / 2 }, { x: x + w - inset, y: y + h },
+                     { x: x + inset, y: y + h }, { x: x, y: y + h / 2 }],
+                    { closed: true, fill: fill, stroke: stroke, dashed: dashed });
+        return;
+    }
+    if (shape === "cylinder" || shape === "cylinder3" || shape === "datastore") {
+        var lip = Math.min(h * 0.18, 14);
+        figure.box(x, y, w, h, { fill: fill, stroke: stroke, radius: Math.min(w, lip * 2) / 2 });
+        figure.box(x, y, w, lip * 2, { fill: "none", stroke: stroke, ellipse: true });
+        return;
+    }
+    if (shape === "umlactor" || shape === "actor") {
+        var head = Math.min(w, h) * 0.22;
+        var cx = x + w / 2;
+        figure.box(cx - head, y, head * 2, head * 2, { fill: fill, stroke: stroke, ellipse: true });
+        figure.line([{ x: cx, y: y + head * 2 }, { x: cx, y: y + h * 0.68 }], { stroke: stroke });
+        figure.line([{ x: x + w * 0.18, y: y + h * 0.42 }, { x: x + w * 0.82, y: y + h * 0.42 }],
+                    { stroke: stroke });
+        figure.line([{ x: x + w * 0.2, y: y + h }, { x: cx, y: y + h * 0.68 },
+                     { x: x + w * 0.8, y: y + h }], { stroke: stroke });
+        return;
+    }
+    if (shape === "umllifeline") {
+        var headHeight = Math.min(h * 0.2, 44);
+        figure.box(x, y, w, headHeight, options);
+        figure.line([{ x: x + w / 2, y: y + headHeight }, { x: x + w / 2, y: y + h }],
+                    { stroke: "border", dashed: true });
+        return;
+    }
+    if (shape === "note") {
+        var fold = Math.min(w, h) * 0.22;
+        figure.line([{ x: x, y: y }, { x: x + w - fold, y: y }, { x: x + w, y: y + fold },
+                     { x: x + w, y: y + h }, { x: x, y: y + h }],
+                    { closed: true, fill: fill, stroke: stroke, dashed: dashed });
+        figure.line([{ x: x + w - fold, y: y }, { x: x + w - fold, y: y + fold },
+                     { x: x + w, y: y + fold }], { stroke: stroke });
+        return;
+    }
+    if (shape === "process") {
+        figure.box(x, y, w, h, options);
+        var bar = Math.min(w * 0.12, 16);
+        figure.line([{ x: x + bar, y: y }, { x: x + bar, y: y + h }], { stroke: stroke });
+        figure.line([{ x: x + w - bar, y: y }, { x: x + w - bar, y: y + h }], { stroke: stroke });
+        return;
+    }
+    if (shape === "document") {
+        figure.line([{ x: x, y: y }, { x: x + w, y: y }, { x: x + w, y: y + h * 0.86 },
+                     { x: x + w * 0.5, y: y + h }, { x: x, y: y + h * 0.86 }],
+                    { closed: true, fill: fill, stroke: stroke, dashed: dashed });
+        return;
+    }
+    if (style.swimlane === true || shape === "swimlane") {
+        var title = drawioNumber(style.startsize) || 23;
+        figure.box(x, y, w, h, { fill: "none", stroke: stroke, dashed: dashed });
+        figure.box(x, y, w, Math.min(title, h), { fill: fill, stroke: stroke });
+        return;
+    }
+    // Everything else, including every stencil this does not know: a rectangle, rounded
+    // when the file says so.
+    figure.box(x, y, w, h, {
+        fill: fill, stroke: stroke, dashed: dashed, strokeWidth: thick,
+        radius: style.rounded === "1" ? Math.min(drawioNumber(style.arcsize) || 10, h / 2) : 0
+    });
+}
+
+// The words in a box, where the file says to put them.
+function drawioVertexLabel(figure, measurer, cell) {
+    var text = drawioLabel(cell.value);
+    if (!text) {
+        return;
+    }
+    var style = cell.style;
+    var size = Math.max(8, Math.min(drawioNumber(style.fontsize) || LABEL_SIZE, 28));
+    var bits = drawioNumber(style.fontstyle);
+    var swimlane = style.swimlane === true || String(style.shape || "").toLowerCase() === "swimlane";
+    var top = style.verticalalign === "top" || swimlane;
+    // Where the words sit across the box. draw.io's default is centred, and a cell that says
+    // otherwise usually means it: a bulleted list of outputs set to `align=left` reads as a
+    // list when it is left-aligned and as a poem when it is not.
+    var align = String(style.align || "center").toLowerCase();
+    var pad = drawioNumber(style.spacingleft) + 4;
+    var x = cell.ax + cell.width / 2;
+    if (align === "left") {
+        x = cell.ax + pad;
+    } else if (align === "right") {
+        x = cell.ax + cell.width - pad;
+    }
+    var y = cell.ay + cell.height / 2;
+    if (swimlane) {
+        y = cell.ay + Math.min(drawioNumber(style.startsize) || 23, cell.height) / 2;
+    } else if (top) {
+        y = cell.ay + measurer.size(text, size, false, false).height / 2 + 4;
+    } else if (style.verticalalign === "bottom") {
+        y = cell.ay + cell.height - measurer.size(text, size, false, false).height / 2 - 4;
+    }
+    drawLines(figure, measurer, text, x, y, {
+        size: size,
+        align: align === "left" || align === "right" ? align : "center",
+        bold: (bits & 1) === 1 || swimlane,
+        italic: (bits & 2) === 2,
+        ink: drawioInk(style.fontcolor, "foreground") === "none"
+            ? "foreground" : drawioInk(style.fontcolor, "foreground")
+    });
+}
+
+// An edge, from wherever the file says it starts to wherever it says it ends.
+//
+// draw.io keeps the *waypoints* somebody dragged, and those are the shape of the line: an
+// edge redrawn as a straight run between two boxes goes through everything the author moved
+// it around. What is not in the file is where it meets each box — that is computed from the
+// direction it arrives in, which is why an edge with no waypoints still leaves and lands
+// somewhere sensible.
+function drawioEdgePath(cell, byID) {
+    var from = byID[cell.source];
+    var to = byID[cell.target];
+    var waypoints = cell.points.slice();
+    var start = from && from.isVertex ? drawioCentre(from) : cell.sourcePoint;
+    var end = to && to.isVertex ? drawioCentre(to) : cell.targetPoint;
+    if (!start || !end) {
+        return null;
+    }
+    if (from && from.isVertex) {
+        start = drawioBorder(from, waypoints.length ? waypoints[0] : end);
+    }
+    if (to && to.isVertex) {
+        end = drawioBorder(to, waypoints.length ? waypoints[waypoints.length - 1] : start);
+    }
+    var points = [start].concat(waypoints, [end]);
+    if (String(cell.style.edgestyle || "").toLowerCase().indexOf("orthogonal") !== -1) {
+        points = drawioOrthogonal(points);
+    }
+    return points;
+}
+
+// Corners rather than diagonals, for an edge whose style asks for them. Each pair that is
+// neither level nor plumb gains one turn: horizontal first, which is what draw.io's own
+// router does for the common left-to-right case.
+function drawioOrthogonal(points) {
+    var out = [points[0]];
+    for (var i = 1; i < points.length; i++) {
+        var previous = out[out.length - 1];
+        var next = points[i];
+        var dx = Math.abs(next.x - previous.x);
+        var dy = Math.abs(next.y - previous.y);
+        if (dx > 1 && dy > 1) {
+            out.push(dx >= dy ? { x: next.x, y: previous.y } : { x: previous.x, y: next.y });
+        }
+        out.push(next);
+    }
+    return out;
+}
+
+// An edge's words, on the line, however many lines they are. `Figure.edgeLabel` knocks the
+// line out from under one row of text; a label with a break in it needs one per row, stacked
+// about the point rather than all at it.
+function drawioEdgeText(figure, measurer, text, x, y) {
+    var lines = String(text).split("\n");
+    var step = SMALL_LABEL_SIZE * 1.35;
+    var top = y - (lines.length - 1) * step / 2;
+    for (var i = 0; i < lines.length; i++) {
+        if (lines[i]) {
+            figure.edgeLabel(measurer, lines[i], x, top + i * step);
+        }
+    }
+}
+
+function drawioEdge(figure, cell, byID) {
+    var points = drawioEdgePath(cell, byID);
+    if (!points) {
+        return null;
+    }
+    var style = cell.style;
+    var endArrow = String(style.endarrow === undefined ? "block" : style.endarrow).toLowerCase();
+    var startArrow = String(style.startarrow === undefined ? "none" : style.startarrow).toLowerCase();
+    figure.line(points, {
+        stroke: drawioInk(style.strokecolor, "border") === "none"
+            ? "border" : drawioInk(style.strokecolor, "border"),
+        dashed: style.dashed === "1",
+        strokeWidth: drawioNumber(style.strokewidth) > 1.5 ? 2 : 1,
+        arrowEnd: endArrow !== "none" && endArrow !== "false",
+        arrowStart: startArrow !== "none" && startArrow !== "false"
+    });
+    return points;
+}
+
+// A point some fraction of the way along a path, measured in length rather than in corners:
+// a long run followed by a short one has its middle in the long one, which is where a reader
+// looks for the label.
+function drawioAlong(points, fraction) {
+    var lengths = [];
+    var total = 0;
+    var i;
+    for (i = 1; i < points.length; i++) {
+        var dx = points[i].x - points[i - 1].x;
+        var dy = points[i].y - points[i - 1].y;
+        var length = Math.sqrt(dx * dx + dy * dy);
+        lengths.push(length);
+        total += length;
+    }
+    if (!total) {
+        return { x: points[0].x, y: points[0].y };
+    }
+    var walked = 0;
+    var want = total * Math.min(Math.max(fraction, 0), 1);
+    for (i = 0; i < lengths.length; i++) {
+        if (walked + lengths[i] >= want) {
+            var t = lengths[i] ? (want - walked) / lengths[i] : 0;
+            return { x: points[i].x + (points[i + 1].x - points[i].x) * t,
+                     y: points[i].y + (points[i + 1].y - points[i].y) * t };
+        }
+        walked += lengths[i];
+    }
+    return { x: points[points.length - 1].x, y: points[points.length - 1].y };
+}
+
+// Whether one box wholly contains another, which is what makes the first a region rather
+// than a node — a hair of tolerance, since a child flush against a container's edge is still
+// inside it as far as anybody reading the diagram is concerned.
+function drawioHolds(outer, inner) {
+    return inner.x >= outer.x - 2 && inner.y >= outer.y - 2
+        && inner.x + inner.width <= outer.x + outer.width + 2
+        && inner.y + inner.height <= outer.y + outer.height + 2;
+}
+
+function drawioInsideAny(point, boxes) {
+    for (var i = 0; i < boxes.length; i++) {
+        var box = boxes[i];
+        if (point.x > box.x - 4 && point.x < box.x + box.width + 4
+            && point.y > box.y - 4 && point.y < box.y + box.height + 4) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Where along its edge a label sits.
+//
+// When the file says — an `edgeLabel` cell keeps a position from -1 to 1 along the line —
+// that is honoured, because somebody dragged it there. An edge's *own* value has no such
+// position and defaults to the middle, which in a crowded diagram is often on top of a box
+// the line passes behind. The label is knocked out of the page so a line does not run
+// through the words, and that same knock-out sitting over a node erases the node's text — so
+// the middle is tried first and then points either side of it, and the first one clear of
+// every box wins. A label that has nowhere clear to go stays in the middle.
+function drawioEdgeLabelPoint(points, cell, boxes) {
+    var point;
+    if (cell && cell.relative && typeof cell.x === "number" && cell.x >= -1 && cell.x <= 1
+        && cell.x !== 0) {
+        point = drawioAlong(points, (cell.x + 1) / 2);
+    } else {
+        var fractions = [0.5, 0.38, 0.62, 0.26, 0.74];
+        for (var i = 0; i < fractions.length; i++) {
+            var spot = drawioAlong(points, fractions[i]);
+            if (!boxes || !drawioInsideAny(spot, boxes)) {
+                point = spot;
+                break;
+            }
+        }
+        point = point || drawioAlong(points, 0.5);
+    }
+    if (cell && cell.offset) {
+        point = { x: point.x + cell.offset.x, y: point.y + cell.offset.y };
+    }
+    return point;
+}
+
+// One page, painted.
+//
+// The order is the z-order and there is no other: edges first so a box is never drawn with a
+// line across its face, then the boxes, then every label, so a container drawn after its
+// contents cannot bury their words.
+function drawioPage(page, measurer, source) {
+    var model = drawioCells(page.model);
+    drawioPlace(model);
+    var cells = model.cells;
+    var figure = new Figure();
+    var paths = {};
+    var boxes = [];
+    var i;
+
+    // What a label must not be dropped on top of: the boxes with words in them, which means
+    // the ones nothing else sits inside. A swimlane or a backdrop is a *region* — it covers
+    // half the canvas — so counting it would leave nowhere clear and put every label back in
+    // the middle, which is what this exists to avoid.
+    //
+    // The test is geometric rather than by parent, because being a container in draw.io is
+    // not the same as being a parent in the file: plenty of diagrams draw the backdrop as an
+    // ordinary rectangle with everything else laid on top of it, parented to the layer. That
+    // shape is a region by every measure a reader uses and by none the XML records.
+    var candidates = [];
+    for (i = 0; i < cells.length; i++) {
+        if (cells[i].isVertex && !cells[i].style.edgelabel
+            && cells[i].width > 0 && cells[i].height > 0) {
+            candidates.push({ x: cells[i].ax, y: cells[i].ay,
+                              width: cells[i].width, height: cells[i].height });
+        }
+    }
+    for (i = 0; i < candidates.length; i++) {
+        var holdsAnother = false;
+        for (var j = 0; j < candidates.length && !holdsAnother; j++) {
+            holdsAnother = j !== i && drawioHolds(candidates[i], candidates[j]);
+        }
+        if (!holdsAnother) {
+            boxes.push(candidates[i]);
+        }
+    }
+
+    for (i = 0; i < cells.length; i++) {
+        if (cells[i].isEdge) {
+            var path = drawioEdge(figure, cells[i], model.byID);
+            if (path) {
+                paths[cells[i].id] = path;
+            }
+        }
+    }
+    for (i = 0; i < cells.length; i++) {
+        if (cells[i].isVertex && !cells[i].style.edgelabel && cells[i].width > 0) {
+            drawioVertexShape(figure, cells[i]);
+        }
+    }
+    for (i = 0; i < cells.length; i++) {
+        var cell = cells[i];
+        if (!cell.isVertex) {
+            continue;
+        }
+        // A label attached to an edge rides on the line rather than sitting in a box of its
+        // own — which is what it looks like in draw.io, and it is how a "yes" branch is told
+        // from a "no" one.
+        if (cell.style.edgelabel || (cell.relative && paths[cell.parent])) {
+            var attached = drawioLabel(cell.value);
+            if (attached && paths[cell.parent]) {
+                var at = drawioEdgeLabelPoint(paths[cell.parent], cell, null);
+                drawioEdgeText(figure, measurer, attached, at.x, at.y);
+            }
+        } else if (cell.width > 0) {
+            drawioVertexLabel(figure, measurer, cell);
+        }
+    }
+    // An edge's *own* value is a label on the line too, and in real files it is far commoner
+    // than the separate cell above: 264 of them against 76 across the diagrams this was
+    // built on. Drawn last, with the rest of the words, so nothing is laid over them.
+    for (i = 0; i < cells.length; i++) {
+        if (cells[i].isEdge && paths[cells[i].id]) {
+            var own = drawioLabel(cells[i].value);
+            if (own) {
+                var point = drawioEdgeLabelPoint(paths[cells[i].id], cells[i], boxes);
+                drawioEdgeText(figure, measurer, own, point.x, point.y);
+            }
+        }
+    }
+
+    var bounds = drawioBounds(figure.shapes);
+    if (!bounds) {
+        return null;
+    }
+    if (bounds.width > DRAWIO_MAX_SPAN || bounds.height > DRAWIO_MAX_SPAN) {
+        return null;
+    }
+    // The page's own coordinates start wherever the author happened to drag the first box.
+    // A figure starts at its own origin, so everything moves by the same amount and nothing
+    // about the arrangement changes.
+    for (i = 0; i < figure.shapes.length; i++) {
+        shiftShape(figure.shapes[i], -bounds.x, -bounds.y);
+    }
+    return figure.figure(bounds.width, bounds.height, page.name || null, source);
+}
+
+// What the page occupies, from what was actually drawn rather than from the geometry: a
+// cylinder's cap and an actor's arms stick out past the cell they came from.
+function drawioBounds(shapes) {
+    var minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (var i = 0; i < shapes.length; i++) {
+        var shape = shapes[i];
+        if (shape.type === "line") {
+            for (var p = 0; p < shape.points.length; p++) {
+                minX = Math.min(minX, shape.points[p].x);
+                maxX = Math.max(maxX, shape.points[p].x);
+                minY = Math.min(minY, shape.points[p].y);
+                maxY = Math.max(maxY, shape.points[p].y);
+            }
+        } else if (shape.type === "label") {
+            minX = Math.min(minX, shape.x);
+            maxX = Math.max(maxX, shape.x);
+            minY = Math.min(minY, shape.y);
+            maxY = Math.max(maxY, shape.y);
+        } else {
+            minX = Math.min(minX, shape.x);
+            maxX = Math.max(maxX, shape.x + shape.width);
+            minY = Math.min(minY, shape.y);
+            maxY = Math.max(maxY, shape.y + shape.height);
+        }
+    }
+    if (!isFinite(minX) || !isFinite(minY) || maxX <= minX || maxY <= minY) {
+        return null;
+    }
+    return { x: minX, y: minY, width: maxX - minX, height: maxY - minY };
+}
+
+// The pages in the file. A `.drawio` holds one `<diagram>` per tab along the bottom of
+// draw.io's own window, and losing all but the first would silently hide most of a document
+// somebody spent an afternoon on.
+function drawioPages(text) {
+    var root = xmlParse(text);
+    if (!root) {
+        return null;
+    }
+    var diagrams = xmlFind(root, "diagram");
+    if (!diagrams.length) {
+        return null;
+    }
+    var pages = [];
+    for (var i = 0; i < diagrams.length && pages.length < DRAWIO_MAX_PAGES; i++) {
+        var model = diagrams[i].children.filter(function (child) {
+            return child.tag === "mxGraphModel";
+        })[0];
+        pages.push({
+            name: diagrams[i].attrs.name || "",
+            model: model || null,
+            // No model and a payload of text means the diagram is deflate-compressed, which
+            // this cannot read. Recorded rather than ignored so the reader is told which
+            // switch to turn off, instead of being shown an empty page.
+            compressed: !model && /[A-Za-z0-9+/=]{40,}/.test(diagrams[i].text || "")
+        });
+    }
+    return pages;
+}
+
+function renderDrawio(text) {
+    if (text.length > PREVIEW_LIMIT) {
+        return tooLarge(text);
+    }
+    var pages = drawioPages(text);
+    if (!pages) {
+        return [
+            { type: "heading", level: 3, source: 0,
+              spans: [span("Not a draw.io file this preview can read", {})] },
+            { type: "paragraph", source: 0, spans: [span(
+                "A .drawio file is an <mxfile> holding one <diagram> per page. This one has "
+                + "neither.", {})] }
+        ];
+    }
+    var measurer = new Measurer();
+    var blocks = [];
+    var drawn = 0;
+    for (var i = 0; i < pages.length; i++) {
+        var page = pages[i];
+        // Named only when there is more than one, since a heading above the single page of a
+        // one-page file is a title nobody asked for.
+        if (pages.length > 1 && page.name) {
+            blocks.push({ type: "heading", level: 3, source: 0,
+                          spans: [span(page.name, {})] });
+        }
+        if (page.compressed) {
+            blocks.push({ type: "paragraph", source: 0, spans: [span(
+                "This page is stored compressed, which this preview cannot read. In draw.io, "
+                + "turn it off with File ▸ Properties ▸ Compressed and save again.", {})] });
+            continue;
+        }
+        var figure = page.model ? drawioPage(page, measurer, 0) : null;
+        if (figure) {
+            blocks.push(figure);
+            drawn++;
+        } else {
+            blocks.push({ type: "paragraph", source: 0, spans: [span(
+                "This page has nothing to draw.", {})] });
+        }
+    }
+    if (!drawn && !blocks.length) {
+        return [{ type: "paragraph", source: 0,
+                  spans: [span("This file has no pages to draw.", {})] }];
+    }
+    return blocks;
+}
+
 function renderFencedDiagram(language, text, source) {
     if (/^mermaid$/i.test(language)) {
         return renderDiagram(text, source);
@@ -2457,6 +3279,13 @@ linelark.addPreview({
     extensions: ["mmd", "mermaid"],
     languages: ["mermaid"],
     render: renderMermaid
+});
+
+linelark.addPreview({
+    id: "drawio",
+    title: "Diagram",
+    extensions: ["drawio", "dio"],
+    render: renderDrawio
 });
 
 linelark.addPreview({
