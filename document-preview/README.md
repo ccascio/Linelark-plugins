@@ -91,7 +91,18 @@ what stops a diagram being invisible on somebody's background, so each fill is r
 meaning it was probably chosen for: green as `positive`, red as `negative`, amber as
 `warning`, blue as `accent`, anything too pale or too grey as a plain surface. A diagram that
 used colour decoratively comes out quieter than it went in; one that used it to say something
-keeps what it was saying. Shapes it does not know — draw.io ships hundreds of stencils —
+keeps what it was saying.
+
+The *words* are a different question, and getting it wrong made them disappear. Run through
+the same table as the fills, a label whose file says `fontColor=#7a5ea8` on a box filled
+`#e1d5e7` came out purple on purple — text that is not there at all. Only two pairings in a
+figure's palette are guaranteed legible, so those are the two used: on a coloured fill the
+words are drawn in the *page* colour, since the theme's accent and its string, number and
+comment colours are all chosen to be readable against the page and contrast is symmetric; on
+a plain surface, or with no box at all, they are the ordinary foreground. A mid-grey
+`fontColor` still reads as quiet, because a subtitle written in grey meant to be one — but
+only a mid grey: near-black is what ordinary text is written in on draw.io's white canvas,
+and reading that as "quiet" turned a document's title into a whisper. Shapes it does not know — draw.io ships hundreds of stencils —
 are drawn as labelled rectangles rather than skipped, because a box in the right place still
 says what is connected to what, and skipping it would lose the edges into it too.
 

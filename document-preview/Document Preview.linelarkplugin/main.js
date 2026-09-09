@@ -2806,6 +2806,46 @@ function drawioVertexShape(figure, cell) {
     });
 }
 
+// What colour the words in a box can safely be.
+//
+// Not the file's `fontColor`, which is the mistake this replaced: run through the same hue
+// table as the fills, a purple label on a purple box came out purple on purple and the text
+// simply was not there. A figure's palette names meanings, and only two pairings in it are
+// *guaranteed* to be legible — that is what has to be leaned on.
+//
+// On a coloured fill the words are drawn in the page colour. The theme's accent and its
+// string, number and comment colours are all chosen to be readable against the page, and
+// contrast is symmetric, so the page is readable against them whichever way round the theme
+// is. On a plain surface, or on no box at all, the ordinary foreground is right — and grey
+// text stays quiet, since a subtitle written in grey meant to be a subtitle.
+function drawioLabelInk(style, fill) {
+    if (fill === "accent" || fill === "positive" || fill === "negative" || fill === "warning") {
+        return "background";
+    }
+    // Only a *mid* grey is a quiet colour. Near-black is what ordinary text is written in on
+    // draw.io's white canvas — reading it as "quiet" turns a document's title into a whisper,
+    // which is exactly what it did — and near-white is ordinary text on a dark one.
+    var grey = drawioGreyLevel(style.fontcolor);
+    return grey >= 0.35 && grey <= 0.78 ? "secondary" : "foreground";
+}
+
+// How light a colour is, when it is grey enough for lightness to be all it says. -1 for
+// anything with a hue in it, or nothing written at all.
+function drawioGreyLevel(colour) {
+    var hex = String(colour || "").trim().toLowerCase().match(/^#?([0-9a-f]{6})$/);
+    if (!hex) {
+        return -1;
+    }
+    var value = parseInt(hex[1], 16);
+    var r = ((value >> 16) & 255) / 255;
+    var g = ((value >> 8) & 255) / 255;
+    var b = (value & 255) / 255;
+    if (Math.max(r, g, b) - Math.min(r, g, b) >= 0.06) {
+        return -1;
+    }
+    return 0.299 * r + 0.587 * g + 0.114 * b;
+}
+
 // The words in a box, where the file says to put them.
 function drawioVertexLabel(figure, measurer, cell) {
     var text = drawioLabel(cell.value);
@@ -2813,9 +2853,14 @@ function drawioVertexLabel(figure, measurer, cell) {
         return;
     }
     var style = cell.style;
+    var shape = String(style.shape || style._first || "").toLowerCase();
+    // The same fill the shape was drawn with, so the words know what they are sitting on.
+    // A text-only cell has no box under it, whatever its style says it would be filled with.
+    var boxed = !(shape === "text" || style.text === true);
+    var fill = boxed ? drawioInk(style.fillcolor, "surface") : "none";
     var size = Math.max(8, Math.min(drawioNumber(style.fontsize) || LABEL_SIZE, 28));
     var bits = drawioNumber(style.fontstyle);
-    var swimlane = style.swimlane === true || String(style.shape || "").toLowerCase() === "swimlane";
+    var swimlane = style.swimlane === true || shape === "swimlane";
     var top = style.verticalalign === "top" || swimlane;
     // Where the words sit across the box. draw.io's default is centred, and a cell that says
     // otherwise usually means it: a bulleted list of outputs set to `align=left` reads as a
@@ -2841,8 +2886,7 @@ function drawioVertexLabel(figure, measurer, cell) {
         align: align === "left" || align === "right" ? align : "center",
         bold: (bits & 1) === 1 || swimlane,
         italic: (bits & 2) === 2,
-        ink: drawioInk(style.fontcolor, "foreground") === "none"
-            ? "foreground" : drawioInk(style.fontcolor, "foreground")
+        ink: drawioLabelInk(style, fill)
     });
 }
 
