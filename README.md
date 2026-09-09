@@ -26,6 +26,7 @@ release of the editor.
 | [`scratch-notes`](scratch-notes/) | Keeping something: notes pinned to a line, saved as you type, and a panel that redraws when the caret moves — the one case `followsCaret` exists for |
 | [`compare-files`](compare-files/) | Comparing and merging: a patience diff computed in JavaScript, drawn by `openDiff` with merge arrows down the middle, and a write back into either file |
 | [`story-bible`](story-bible/) | Sections as tabs, several autosaving boxes at once, and what a plugin owes a box it rewrites while somebody is typing into it |
+| [`launcher`](launcher/) | Running something: the applications a project is, each started in a terminal you can watch and stop — and the two things a plugin may not do quietly, a shell and a folder panel, each gated on a click |
 
 Each folder holds a `README.md` and the `.linelarkplugin` bundle itself. The bundle is what
 gets installed; the folder around it is where the plugin is documented.
@@ -59,9 +60,10 @@ timers and promises, and the limits worth knowing before designing around them �
 `apiVersion` 1 for most of these. `scratch-notes` and `story-bible` need 3 for the plugin
 store and autosaving fields; `compare-files` needs 4 for merge callbacks in `openDiff`;
 `github` needs 8 to say which project in a multi-root workspace its git actions are about;
-`document-preview` needs 9 to draw a diagram it has laid out itself. An older host refuses to
-load them and says so, and each manifest carries the `minimumAppVersion` that turns its
-generation into a release a reader can act on. Git is Studio-only: the sandbox blocks subprocesses, so the App Store edition
+`document-preview` needs 9 to draw a diagram it has laid out itself; `launcher` needs 10 to
+run commands in the terminal panel. An older host refuses to load them and says so, and each
+manifest carries the `minimumAppVersion` that turns its generation into a release a reader
+can act on. Git is Studio-only: the sandbox blocks subprocesses, so the App Store edition
 does not ship the git reader at all and `repoIsAvailable()` answers `false` there. A plugin
 that uses it should check and explain itself rather than showing an empty panel.
 
@@ -70,6 +72,13 @@ plugin declares `"git": "write"` in its manifest and the user switches it on in 
 Plugins. Nothing in the API can force-push, reset, discard or merge, and `repoPullAsync` is
 fast-forward only, so the worst a granted plugin can do is make a commit you did not want —
 which is in the reflog like any other.
+
+Running commands is Studio-only as well — there is no terminal panel in the sandbox — and
+asked for the same way: `"terminal": "run"` in the manifest, switched on in Manage Plugins.
+It is the widest permission here, since a command can do anything you can do, so it has a
+switch of its own rather than riding on either of the others. Two things keep it answerable:
+it works only from something you clicked, never from a timer, and what it runs is typed into
+a shell you can see, read and stop rather than a process you were never shown.
 
 ## Licence
 

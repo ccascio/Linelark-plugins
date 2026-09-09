@@ -120,6 +120,8 @@ Generation 5 covers `addContextMenuItem`. Generation 6 covers remote management
 `workspaceFolders()` and `repoSelectFolder(path)` — which project in a multi-root workspace
 the git calls are about. Generation 9 covers the `figure` preview node — a diagram the plugin
 lays out itself — and `measureText`, which is what makes laying one out possible.
+Generation 10 covers `runInTerminal` and `canRunInTerminal` — command lines typed at a shell
+in the terminal panel — plus `chooseFolder`.
 
 **`minimumAppVersion` is what the catalog says out loud.** `apiVersion` is the gate: the host
 compares it against its own generation and refuses what it cannot load. But a number is not
@@ -139,6 +141,7 @@ stating it here safe: the worst a wrong one does is name the wrong release in th
   "apiVersion": 1,
   "minimumAppVersion": "1.3.0",
   "git": "write",
+  "terminal": "run",
   "hosts": ["api.example.com"],
   "secrets": [
     { "name": "apiKey", "label": "API key", "header": "x-api-key",
@@ -151,7 +154,9 @@ Commands, panels and previews are **not** listed here — the script registers t
 is one source of truth. A credential that cannot be honoured **fails the manifest**: one naming an
 undeclared host, two sharing a name, or two competing for the same (host, header).
 
-`"git": "write"` asks to change the repository — stage, commit, fetch, pull, push, switch
+`"terminal": "run"` asks to run commands, and is the widest thing a manifest can ask for:
+anything the other two grant, a command can do anyway. It is granted on its own switch for
+that reason. `"git": "write"` asks to change the repository — stage, commit, fetch, pull, push, switch
 branches. Like `hosts` it is a *request*: the user grants it separately in Manage Plugins,
 against the manifest's capability fingerprint, so adding a host later revokes the git
 permission too. Reading git needs no declaration.
@@ -178,7 +183,9 @@ Opening       openFile(path) · openVirtual({key, name, text, label, language})
               openDiff({key, name, patch, label}) · folderRoot() · workspaceFolders()
 Scheduling    setTimeout · setInterval · clearTimeout · clearInterval · queueMicrotask
 Keeping       storeGet(key) · storeSet(key, value) · storeRemove(key) · storeKeys()
-Handing out   copyToClipboard(text) · exportFile({name, text})
+Handing out   copyToClipboard(text) · exportFile({name, text}) · chooseFolder({message})
+Running       canRunInTerminal() · runInTerminal({name, folder, commands})
+ (Studio, asks)
 Network       fetch({url, method, headers, body, timeout}) · canReachNetwork() · hasSecret(name)
 Signing in    setSecret(name, value) · clearSecret(name)
 Which project repoSelectFolder(path) · repoSelectedFolder()
@@ -368,9 +375,28 @@ the one after it.
   quietly.** The save panel *is* the consent, so there is no path argument: a plugin offers
   a name and the text, and where it goes belongs to the user. `false` is usually just a
   cancelled panel, which is not an error.
-- **Studio-only:** git and network. `repoIsAvailable()`, `repoCanWrite()` and
-  `canReachNetwork()` answer `false` in the sandboxed App Store edition — check and explain,
-  or the panel reads as broken.
+- **`runInTerminal` types; it does not spawn.** The lines go to a shell in the terminal
+  panel, which is then shown, and nothing comes back — no exit status, no output, no
+  promise. That is the trade: the output belongs to a pane the user can read, ⌃C and scroll
+  back through, rather than to a process nobody was shown. It needs `"terminal": "run"`,
+  the permission, and a **direct user action** — a click, never a timer, a `render` or
+  anything after an `await`, which ends the gesture. `commands` is one string or an array of
+  them, typed as **one** shell line joined with `;` — so a failed one does not stop the
+  next, and `a && b` written on one line is how to ask for the other thing. Not one line
+  each: the shell would not read the later ones until the first finished, and whatever it
+  started reads them instead — `sudo` takes the next command as its password. At most 20
+  commands of 4,096 characters, and a control character in one — a
+  newline, a tab, an escape — is refused rather than typed. `folder` may be absolute,
+  `~`-relative or relative to the folder in front, and must exist. Running the same `name`
+  in the same folder again goes back to the same shell.
+- **`chooseFolder({message})` is `exportFile`'s mirror**, and needs no declaration for the
+  same reason: the panel on screen is the permission. It answers with the path chosen or
+  `""` for a cancel, wants a user action, and — being the one call that writes into a box
+  somebody may be typing in — needs the revision trick in the field's id (`launcher` does
+  this).
+- **Studio-only:** git, network and the terminal. `repoIsAvailable()`, `repoCanWrite()`,
+  `canRunInTerminal()` and `canReachNetwork()` answer `false` in the sandboxed App Store
+  edition — check and explain, or the panel reads as broken.
 - **Nothing can force, reset or merge.** Not "do not do this" — there is no call for it.
   `repoPullAsync` is `--ff-only` and a diverged push is rejected by git. Report what
   `output` says and leave the rest to the terminal.
