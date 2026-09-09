@@ -1,7 +1,7 @@
 {
   "id": "com.linelark.example.documentpreview",
   "name": "Document Preview",
-  "version": "1.4.0",
+  "version": "1.4.1",
   "apiVersion": 9,
   "minimumAppVersion": "1.10.0",
   "main": "main.js",

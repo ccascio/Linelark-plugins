@@ -908,7 +908,7 @@ Figure.prototype.label = function (text, x, y, options) {
     this.shapes.push({
         type: "label", text: text, x: x, y: y,
         size: options.size || LABEL_SIZE,
-        align: options.align || "center",
+        align: options.align === "left" ? "leading" : options.align === "right" ? "trailing" : (options.align || "center"),
         baseline: options.baseline || "middle",
         bold: !!options.bold,
         italic: !!options.italic,
@@ -2540,47 +2540,12 @@ function drawioLabel(value) {
 // read as one. Anything too pale or too grey to carry a meaning is a plain surface.
 function drawioInk(colour, fallback) {
     var text = String(colour || "").trim().toLowerCase();
-    if (!text || text === "none") {
-        return text === "none" ? "none" : fallback;
+    if (text === "none") { return "none"; }
+    if (/^#[0-9a-f]{6}$/.test(text)) { return text; }
+    if (/^#[0-9a-f]{3}$/.test(text)) {
+        return "#" + text.slice(1).split("").map(function (c) { return c + c; }).join("");
     }
-    var hex = text.match(/^#?([0-9a-f]{6})$/);
-    if (!hex) {
-        return fallback;
-    }
-    var value = parseInt(hex[1], 16);
-    var r = ((value >> 16) & 255) / 255;
-    var g = ((value >> 8) & 255) / 255;
-    var b = (value & 255) / 255;
-    var max = Math.max(r, g, b);
-    var min = Math.min(r, g, b);
-    var delta = max - min;
-    if (delta < 0.06) {
-        return "surface";
-    }
-    var hue;
-    if (max === r) {
-        hue = 60 * (((g - b) / delta) % 6);
-    } else if (max === g) {
-        hue = 60 * ((b - r) / delta + 2);
-    } else {
-        hue = 60 * ((r - g) / delta + 4);
-    }
-    if (hue < 0) {
-        hue += 360;
-    }
-    if (hue < 20 || hue >= 330) {
-        return "negative";
-    }
-    if (hue < 65) {
-        return "warning";
-    }
-    if (hue < 170) {
-        return "positive";
-    }
-    if (hue < 280) {
-        return "accent";
-    }
-    return "surface";
+    return fallback;
 }
 
 // One page's cells, read out of its `<mxGraphModel>`.
@@ -2717,8 +2682,8 @@ function drawioVertexShape(figure, cell) {
     var y = cell.ay;
     var w = cell.width;
     var h = cell.height;
-    var fill = drawioInk(style.fillcolor, "surface");
-    var stroke = drawioInk(style.strokecolor, "border");
+    var fill = drawioInk(style.fillcolor, "#ffffff");
+    var stroke = drawioInk(style.strokecolor, "#000000");
     var dashed = style.dashed === "1";
     var thick = drawioNumber(style.strokewidth) > 1.5 ? 2 : 1;
     var options = { fill: fill, stroke: stroke, dashed: dashed, strokeWidth: thick };
@@ -2747,9 +2712,22 @@ function drawioVertexShape(figure, cell) {
         return;
     }
     if (shape === "cylinder" || shape === "cylinder3" || shape === "datastore") {
-        var lip = Math.min(h * 0.18, 14);
-        figure.box(x, y, w, h, { fill: fill, stroke: stroke, radius: Math.min(w, lip * 2) / 2 });
-        figure.box(x, y, w, lip * 2, { fill: "none", stroke: stroke, ellipse: true });
+        var lip = Math.min(h / 2, drawioNumber(style.size) || Math.min(h * 0.18, 14));
+        // One cylinder silhouette: upper back rim, straight sides and curved base.
+        // A rounded rectangle underneath an ellipse leaves an extra horizontal outline.
+        function arc(cy, start, end) {
+            var points = [];
+            for (var i = 0; i <= 24; i++) {
+                var angle = start + (end - start) * i / 24;
+                points.push({ x: x + w / 2 + w / 2 * Math.cos(angle),
+                              y: cy + lip * Math.sin(angle) });
+            }
+            return points;
+        }
+        figure.line(arc(y + lip, Math.PI, Math.PI * 2).concat(arc(y + h - lip, 0, Math.PI)),
+            { closed: true, fill: fill, stroke: stroke, strokeWidth: thick, dashed: dashed });
+        figure.line(arc(y + lip, 0, Math.PI),
+            { stroke: stroke, strokeWidth: thick, dashed: dashed });
         return;
     }
     if (shape === "umlactor" || shape === "actor") {
@@ -2819,14 +2797,7 @@ function drawioVertexShape(figure, cell) {
 // is. On a plain surface, or on no box at all, the ordinary foreground is right — and grey
 // text stays quiet, since a subtitle written in grey meant to be a subtitle.
 function drawioLabelInk(style, fill) {
-    if (fill === "accent" || fill === "positive" || fill === "negative" || fill === "warning") {
-        return "background";
-    }
-    // Only a *mid* grey is a quiet colour. Near-black is what ordinary text is written in on
-    // draw.io's white canvas — reading it as "quiet" turns a document's title into a whisper,
-    // which is exactly what it did — and near-white is ordinary text on a dark one.
-    var grey = drawioGreyLevel(style.fontcolor);
-    return grey >= 0.35 && grey <= 0.78 ? "secondary" : "foreground";
+    return drawioInk(style.fontcolor, "#000000");
 }
 
 // How light a colour is, when it is grey enough for lightness to be all it says. -1 for
@@ -2847,6 +2818,30 @@ function drawioGreyLevel(colour) {
 }
 
 // The words in a box, where the file says to put them.
+// Wrap at measured word boundaries, splitting long tokens when necessary.
+function drawioWrapLabel(text, measurer, size, bold, width) {
+    return text.split("\n").map(function (paragraph) {
+        var lines = [], line = "";
+        paragraph.split(/\s+/).forEach(function (word) {
+            if (!word) { return; }
+            var candidate = line ? line + " " + word : word;
+            if (measurer.size(candidate, size, bold, false).width <= width) {
+                line = candidate;
+                return;
+            }
+            if (line) { lines.push(line); line = ""; }
+            Array.from(word).forEach(function (character) {
+                if (line && measurer.size(line + character, size, bold, false).width > width) {
+                    lines.push(line); line = "";
+                }
+                line += character;
+            });
+        });
+        lines.push(line);
+        return lines.join("\n");
+    }).join("\n");
+}
+
 function drawioVertexLabel(figure, measurer, cell) {
     var text = drawioLabel(cell.value);
     if (!text) {
@@ -2857,7 +2852,7 @@ function drawioVertexLabel(figure, measurer, cell) {
     // The same fill the shape was drawn with, so the words know what they are sitting on.
     // A text-only cell has no box under it, whatever its style says it would be filled with.
     var boxed = !(shape === "text" || style.text === true);
-    var fill = boxed ? drawioInk(style.fillcolor, "surface") : "none";
+    var fill = boxed ? drawioInk(style.fillcolor, "#ffffff") : "none";
     var size = Math.max(8, Math.min(drawioNumber(style.fontsize) || LABEL_SIZE, 28));
     var bits = drawioNumber(style.fontstyle);
     var swimlane = style.swimlane === true || shape === "swimlane";
@@ -2866,21 +2861,38 @@ function drawioVertexLabel(figure, measurer, cell) {
     // otherwise usually means it: a bulleted list of outputs set to `align=left` reads as a
     // list when it is left-aligned and as a poem when it is not.
     var align = String(style.align || "center").toLowerCase();
-    var pad = drawioNumber(style.spacingleft) + 4;
-    var x = cell.ax + cell.width / 2;
+    var spacing = style.spacing === undefined ? 2 : drawioNumber(style.spacing);
+    var pad = Math.max(0, spacing + drawioNumber(style.spacingleft)) + 2;
+    var rightPad = Math.max(0, spacing + drawioNumber(style.spacingright)) + 2;
+    var topPad = Math.max(0, spacing + drawioNumber(style.spacingtop)) + 2;
+    var bottomPad = Math.max(0, spacing + drawioNumber(style.spacingbottom)) + 2;
+    var bold = (bits & 1) === 1 || swimlane;
+    var availableWidth = Math.max(1, cell.width - pad - rightPad);
+    var availableHeight = Math.max(1, (swimlane
+        ? Math.min(drawioNumber(style.startsize) || 23, cell.height) : cell.height) - topPad - bottomPad);
+    var original = text;
+    var measured;
+    do {
+        text = drawioWrapLabel(original, measurer, size, bold, availableWidth);
+        measured = measureLines(measurer, text, size, bold, false);
+        if (measured.height <= availableHeight || size <= 1) { break; }
+        size = Math.max(1, size - 1);
+    } while (true);
+    var x = cell.ax + pad + availableWidth / 2;
     if (align === "left") {
         x = cell.ax + pad;
     } else if (align === "right") {
-        x = cell.ax + cell.width - pad;
+        x = cell.ax + cell.width - rightPad;
     }
-    var y = cell.ay + cell.height / 2;
+    var y = cell.ay + topPad + availableHeight / 2;
     if (swimlane) {
         y = cell.ay + Math.min(drawioNumber(style.startsize) || 23, cell.height) / 2;
     } else if (top) {
-        y = cell.ay + measurer.size(text, size, false, false).height / 2 + 4;
+        y = cell.ay + measured.height / 2 + topPad;
     } else if (style.verticalalign === "bottom") {
-        y = cell.ay + cell.height - measurer.size(text, size, false, false).height / 2 - 4;
+        y = cell.ay + cell.height - measured.height / 2 - bottomPad;
     }
+    if (cell.offset) { x += cell.offset.x; y += cell.offset.y; }
     drawLines(figure, measurer, text, x, y, {
         size: size,
         align: align === "left" || align === "right" ? align : "center",
@@ -2897,26 +2909,92 @@ function drawioVertexLabel(figure, measurer, cell) {
 // it around. What is not in the file is where it meets each box — that is computed from the
 // direction it arrives in, which is why an edge with no waypoints still leaves and lands
 // somewhere sensible.
+function drawioPort(vertex, style, prefix, towards) {
+    if (!vertex || !vertex.isVertex) { return null; }
+    if (style[prefix + "x"] === undefined || style[prefix + "y"] === undefined) {
+        return drawioBorder(vertex, towards);
+    }
+    return { x: vertex.ax + drawioNumber(style[prefix + "x"]) * vertex.width
+                + drawioNumber(style[prefix + "dx"]),
+             y: vertex.ay + drawioNumber(style[prefix + "y"]) * vertex.height
+                + drawioNumber(style[prefix + "dy"]) };
+}
+
+function drawioDirection(vertex, point) {
+    if (!vertex) { return { x: 1, y: 0 }; }
+    var sides = [
+        { d: Math.abs(point.x - vertex.ax), x: -1, y: 0 },
+        { d: Math.abs(point.x - vertex.ax - vertex.width), x: 1, y: 0 },
+        { d: Math.abs(point.y - vertex.ay), x: 0, y: -1 },
+        { d: Math.abs(point.y - vertex.ay - vertex.height), x: 0, y: 1 }
+    ];
+    sides.sort(function (a, b) { return a.d - b.d; });
+    return sides[0];
+}
+
 function drawioEdgePath(cell, byID) {
-    var from = byID[cell.source];
-    var to = byID[cell.target];
-    var waypoints = cell.points.slice();
-    var start = from && from.isVertex ? drawioCentre(from) : cell.sourcePoint;
-    var end = to && to.isVertex ? drawioCentre(to) : cell.targetPoint;
-    if (!start || !end) {
-        return null;
-    }
-    if (from && from.isVertex) {
-        start = drawioBorder(from, waypoints.length ? waypoints[0] : end);
-    }
-    if (to && to.isVertex) {
-        end = drawioBorder(to, waypoints.length ? waypoints[waypoints.length - 1] : start);
-    }
+    var from = byID[cell.source], to = byID[cell.target];
+    var parent = byID[cell.parent];
+    var ox = parent && parent.isVertex ? parent.ax : 0;
+    var oy = parent && parent.isVertex ? parent.ay : 0;
+    function absolute(p) { return p ? { x: p.x + ox, y: p.y + oy } : null; }
+    var waypoints = cell.points.map(absolute);
+    var start = from && from.isVertex ? drawioCentre(from) : absolute(cell.sourcePoint);
+    var end = to && to.isVertex ? drawioCentre(to) : absolute(cell.targetPoint);
+    if (!start || !end) { return null; }
+    start = drawioPort(from, cell.style, "exit", waypoints[0] || end) || start;
+    end = drawioPort(to, cell.style, "entry", waypoints[waypoints.length - 1] || start) || end;
     var points = [start].concat(waypoints, [end]);
-    if (String(cell.style.edgestyle || "").toLowerCase().indexOf("orthogonal") !== -1) {
-        points = drawioOrthogonal(points);
+    if (/orthogonal|elbow/i.test(cell.style.edgestyle || "")) {
+        var a = drawioDirection(from, start), b = drawioDirection(to, end);
+        var jetty = Math.max(12, drawioNumber(cell.style.jettysize) || 20);
+        var first = { x: start.x + a.x * jetty, y: start.y + a.y * jetty };
+        var last = { x: end.x + b.x * jetty, y: end.y + b.y * jetty };
+        var middle = waypoints;
+        if (!middle.length) {
+            if (a.x && b.x) {
+                var mx = (first.x + last.x) / 2;
+                middle = [{ x: mx, y: first.y }, { x: mx, y: last.y }];
+            } else if (a.y && b.y) {
+                var my = (first.y + last.y) / 2;
+                middle = [{ x: first.x, y: my }, { x: last.x, y: my }];
+            } else {
+                middle = [a.x ? { x: last.x, y: first.y } : { x: first.x, y: last.y }];
+            }
+        }
+        points = [start].concat(drawioOrthogonal([first].concat(middle, [last])), [end]);
     }
-    return points;
+    var clean = points.filter(function (p, i) {
+        return !i || Math.abs(p.x - points[i - 1].x) + Math.abs(p.y - points[i - 1].y) > 0.001;
+    });
+    for (var i = 1; i < clean.length - 1;) {
+        var a = clean[i - 1], b = clean[i], c = clean[i + 1];
+        if ((b.x-a.x)*(c.y-b.y) === (b.y-a.y)*(c.x-b.x)
+            && (b.x-a.x)*(c.x-b.x)+(b.y-a.y)*(c.y-b.y) >= 0) { clean.splice(i, 1); }
+        else { i++; }
+    }
+    return clean;
+}
+
+// Approximate rounded elbows with short segments in the native polyline vocabulary.
+function drawioRound(points) {
+    var out = [points[0]];
+    for (var i = 1; i < points.length - 1; i++) {
+        var p = points[i], before = points[i - 1], after = points[i + 1];
+        var d1 = Math.hypot(p.x - before.x, p.y - before.y);
+        var d2 = Math.hypot(after.x - p.x, after.y - p.y);
+        var r = Math.min(8, d1 / 2, d2 / 2);
+        var a = { x: p.x + (before.x - p.x) * r / d1, y: p.y + (before.y - p.y) * r / d1 };
+        var b = { x: p.x + (after.x - p.x) * r / d2, y: p.y + (after.y - p.y) * r / d2 };
+        out.push(a);
+        for (var j = 1; j <= 4; j++) {
+            var t = j / 4, u = 1 - t;
+            out.push({ x: u*u*a.x + 2*u*t*p.x + t*t*b.x,
+                       y: u*u*a.y + 2*u*t*p.y + t*t*b.y });
+        }
+    }
+    out.push(points[points.length - 1]);
+    return out;
 }
 
 // Corners rather than diagonals, for an edge whose style asks for them. Each pair that is
@@ -2940,33 +3018,78 @@ function drawioOrthogonal(points) {
 // An edge's words, on the line, however many lines they are. `Figure.edgeLabel` knocks the
 // line out from under one row of text; a label with a break in it needs one per row, stacked
 // about the point rather than all at it.
-function drawioEdgeText(figure, measurer, text, x, y) {
-    var lines = String(text).split("\n");
-    var step = SMALL_LABEL_SIZE * 1.35;
-    var top = y - (lines.length - 1) * step / 2;
-    for (var i = 0; i < lines.length; i++) {
-        if (lines[i]) {
-            figure.edgeLabel(measurer, lines[i], x, top + i * step);
-        }
+function drawioEdgeText(figure, measurer, text, x, y, style) {
+    style = style || {};
+    var size = Math.max(1, Math.min(drawioNumber(style.fontsize) || SMALL_LABEL_SIZE, 400));
+    var bold = (drawioNumber(style.fontstyle) & 1) !== 0;
+    var measured = measureLines(measurer, text, size, bold, false);
+    var align = style.align || "center";
+    var left = align === "left" ? x : align === "right" ? x - measured.width : x - measured.width / 2;
+    figure.box(left - 3, y - measured.height / 2 - 1, measured.width + 6, measured.height + 2,
+        { fill: drawioInk(style.labelbackgroundcolor, "#ffffff"), stroke: "none" });
+    drawLines(figure, measurer, text, x, y, { size: size, bold: bold, align: align,
+        italic: (drawioNumber(style.fontstyle) & 2) !== 0, ink: drawioLabelInk(style, "none") });
+}
+
+function drawioMarker(figure, tip, origin, kind, size, filled, ink, width) {
+    if (kind === "none" || kind === "false") { return; }
+    var dx = tip.x - origin.x, dy = tip.y - origin.y;
+    var length = Math.hypot(dx, dy);
+    if (!length) { return; }
+    var ux = dx / length, uy = dy / length;
+    function point(back, side) {
+        return { x: tip.x - ux * back - uy * side, y: tip.y - uy * back + ux * side };
     }
+    var points;
+    if (kind === "diamond" || kind === "diamondthin") {
+        points = [tip, point(size / 2, size * 0.4), point(size, 0), point(size / 2, -size * 0.4)];
+    } else if (kind === "oval") {
+        points = [];
+        for (var i = 0; i < 16; i++) {
+            var angle = i * Math.PI / 8;
+            points.push(point(size / 2 + Math.cos(angle) * size / 2, Math.sin(angle) * size / 2));
+        }
+    } else {
+        points = [point(size, size * 0.45), tip, point(size, -size * 0.45)];
+        if (/classic/.test(kind)) { points.push(point(size * 0.75, 0)); }
+    }
+    var open = /^open/.test(kind);
+    figure.line(points, { stroke: ink, strokeWidth: width, closed: !open,
+        fill: open ? "none" : filled ? ink : "#ffffff" });
 }
 
 function drawioEdge(figure, cell, byID) {
     var points = drawioEdgePath(cell, byID);
-    if (!points) {
-        return null;
-    }
+    if (!points || points.length < 2) { return null; }
     var style = cell.style;
-    var endArrow = String(style.endarrow === undefined ? "block" : style.endarrow).toLowerCase();
-    var startArrow = String(style.startarrow === undefined ? "none" : style.startarrow).toLowerCase();
-    figure.line(points, {
-        stroke: drawioInk(style.strokecolor, "border") === "none"
-            ? "border" : drawioInk(style.strokecolor, "border"),
-        dashed: style.dashed === "1",
-        strokeWidth: drawioNumber(style.strokewidth) > 1.5 ? 2 : 1,
-        arrowEnd: endArrow !== "none" && endArrow !== "false",
-        arrowStart: startArrow !== "none" && startArrow !== "false"
-    });
+    var ink = drawioInk(style.strokecolor, "#000000");
+    if (ink === "surface") { ink = "secondary"; }
+    var width = Math.max(1, drawioNumber(style.strokewidth) || 1);
+    var shaft = points.map(function (p) { return { x: p.x, y: p.y }; });
+    // Stop the shaft at the base of closed markers so it cannot poke through the tip.
+    function shorten(index, adjacent, kind, size) {
+        if (kind === "none" || kind === "false" || /^open/.test(kind)) { return; }
+        var tip = shaft[index], towards = shaft[adjacent];
+        var length = Math.hypot(towards.x - tip.x, towards.y - tip.y);
+        var amount = Math.min(size * (/classic/.test(kind) ? 0.75 : 1), length * 0.8);
+        if (length) { shaft[index] = { x: tip.x + (towards.x - tip.x) * amount / length,
+                                      y: tip.y + (towards.y - tip.y) * amount / length }; }
+    }
+    shorten(0, 1, String(style.startarrow || "none"), Math.max(12, drawioNumber(style.startsize) * 2 || 12, width * 5));
+    shorten(shaft.length - 1, shaft.length - 2, String(style.endarrow === undefined ? "block" : style.endarrow),
+        Math.max(12, drawioNumber(style.endsize) * 2 || 12, width * 5));
+    var rendered = style.rounded === "1" ? drawioRound(shaft) : shaft;
+    // The host accepts at most 64 points in one primitive.
+    for (var i = 0; i < rendered.length - 1; i += 63) {
+        figure.line(rendered.slice(i, i + 64), {
+            stroke: ink, dashed: style.dashed === "1", strokeWidth: width
+        });
+    }
+    drawioMarker(figure, points[0], points[1], String(style.startarrow || "none").toLowerCase(),
+        Math.max(12, drawioNumber(style.startsize) * 2 || 12, width * 5), style.startfill !== "0", ink, width);
+    drawioMarker(figure, points[points.length - 1], points[points.length - 2],
+        String(style.endarrow === undefined ? "block" : style.endarrow).toLowerCase(),
+        Math.max(12, drawioNumber(style.endsize) * 2 || 12, width * 5), style.endfill !== "0", ink, width);
     return points;
 }
 
@@ -3020,33 +3143,20 @@ function drawioInsideAny(point, boxes) {
     return false;
 }
 
-// Where along its edge a label sits.
-//
-// When the file says — an `edgeLabel` cell keeps a position from -1 to 1 along the line —
-// that is honoured, because somebody dragged it there. An edge's *own* value has no such
-// position and defaults to the middle, which in a crowded diagram is often on top of a box
-// the line passes behind. The label is knocked out of the page so a line does not run
-// through the words, and that same knock-out sitting over a node erases the node's text — so
-// the middle is tried first and then points either side of it, and the first one clear of
-// every box wins. A label that has nowhere clear to go stays in the middle.
+// Honor the saved along-edge position, perpendicular distance and absolute offset.
 function drawioEdgeLabelPoint(points, cell, boxes) {
-    var point;
-    if (cell && cell.relative && typeof cell.x === "number" && cell.x >= -1 && cell.x <= 1
-        && cell.x !== 0) {
-        point = drawioAlong(points, (cell.x + 1) / 2);
-    } else {
-        var fractions = [0.5, 0.38, 0.62, 0.26, 0.74];
-        for (var i = 0; i < fractions.length; i++) {
-            var spot = drawioAlong(points, fractions[i]);
-            if (!boxes || !drawioInsideAny(spot, boxes)) {
-                point = spot;
-                break;
-            }
-        }
-        point = point || drawioAlong(points, 0.5);
+    var fraction = cell && cell.relative ? (cell.x + 1) / 2 : 0.5;
+    var point = drawioAlong(points, fraction);
+    if (cell && cell.relative && cell.y) {
+        var before = drawioAlong(points, Math.max(0, fraction - 0.0001));
+        var after = drawioAlong(points, Math.min(1, fraction + 0.0001));
+        var dx = after.x - before.x, dy = after.y - before.y;
+        var length = Math.hypot(dx, dy) || 1;
+        point.x += dy / length * cell.y;
+        point.y -= dx / length * cell.y;
     }
     if (cell && cell.offset) {
-        point = { x: point.x + cell.offset.x, y: point.y + cell.offset.y };
+        point.x += cell.offset.x; point.y += cell.offset.y;
     }
     return point;
 }
@@ -3065,32 +3175,19 @@ function drawioPage(page, measurer, source) {
     var boxes = [];
     var i;
 
-    // What a label must not be dropped on top of: the boxes with words in them, which means
-    // the ones nothing else sits inside. A swimlane or a backdrop is a *region* — it covers
-    // half the canvas — so counting it would leave nowhere clear and put every label back in
-    // the middle, which is what this exists to avoid.
-    //
-    // The test is geometric rather than by parent, because being a container in draw.io is
-    // not the same as being a parent in the file: plenty of diagrams draw the backdrop as an
-    // ordinary rectangle with everything else laid on top of it, parented to the layer. That
-    // shape is a region by every measure a reader uses and by none the XML records.
-    var candidates = [];
-    for (i = 0; i < cells.length; i++) {
-        if (cells[i].isVertex && !cells[i].style.edgelabel
-            && cells[i].width > 0 && cells[i].height > 0) {
-            candidates.push({ x: cells[i].ax, y: cells[i].ay,
-                              width: cells[i].width, height: cells[i].height });
-        }
-    }
-    for (i = 0; i < candidates.length; i++) {
-        var holdsAnother = false;
-        for (var j = 0; j < candidates.length && !holdsAnother; j++) {
-            holdsAnother = j !== i && drawioHolds(candidates[i], candidates[j]);
-        }
-        if (!holdsAnother) {
-            boxes.push(candidates[i]);
-        }
-    }
+    var regions = {};
+    cells.forEach(function (cell) {
+        if (!cell.isVertex || !cell.width || !cell.height) { return; }
+        regions[cell.id] = cells.some(function (other) {
+            return other.id !== cell.id && other.isVertex && other.width > 0 && other.height > 0
+                && cell.width * cell.height > other.width * other.height
+                && drawioHolds({ x: cell.ax, y: cell.ay, width: cell.width, height: cell.height },
+                    { x: other.ax, y: other.ay, width: other.width, height: other.height });
+        });
+    });
+    cells.filter(function (cell) { return regions[cell.id]; })
+        .sort(function (a, b) { return b.width * b.height - a.width * a.height; })
+        .forEach(function (cell) { drawioVertexShape(figure, cell); });
 
     for (i = 0; i < cells.length; i++) {
         if (cells[i].isEdge) {
@@ -3101,7 +3198,7 @@ function drawioPage(page, measurer, source) {
         }
     }
     for (i = 0; i < cells.length; i++) {
-        if (cells[i].isVertex && !cells[i].style.edgelabel && cells[i].width > 0) {
+        if (cells[i].isVertex && !regions[cells[i].id] && !cells[i].style.edgelabel && cells[i].width > 0) {
             drawioVertexShape(figure, cells[i]);
         }
     }
@@ -3117,7 +3214,7 @@ function drawioPage(page, measurer, source) {
             var attached = drawioLabel(cell.value);
             if (attached && paths[cell.parent]) {
                 var at = drawioEdgeLabelPoint(paths[cell.parent], cell, null);
-                drawioEdgeText(figure, measurer, attached, at.x, at.y);
+                drawioEdgeText(figure, measurer, attached, at.x, at.y, cell.style);
             }
         } else if (cell.width > 0) {
             drawioVertexLabel(figure, measurer, cell);
@@ -3131,12 +3228,12 @@ function drawioPage(page, measurer, source) {
             var own = drawioLabel(cells[i].value);
             if (own) {
                 var point = drawioEdgeLabelPoint(paths[cells[i].id], cells[i], boxes);
-                drawioEdgeText(figure, measurer, own, point.x, point.y);
+                drawioEdgeText(figure, measurer, own, point.x, point.y, cells[i].style);
             }
         }
     }
 
-    var bounds = drawioBounds(figure.shapes);
+    var bounds = drawioBounds(figure.shapes, measurer);
     if (!bounds) {
         return null;
     }
@@ -3149,12 +3246,14 @@ function drawioPage(page, measurer, source) {
     for (i = 0; i < figure.shapes.length; i++) {
         shiftShape(figure.shapes[i], -bounds.x, -bounds.y);
     }
+    figure.shapes.unshift({ type: "box", x: 0, y: 0, width: bounds.width, height: bounds.height,
+        fill: drawioInk(page.model.attrs.background, "#ffffff"), stroke: "none" });
     return figure.figure(bounds.width, bounds.height, page.name || null, source);
 }
 
 // What the page occupies, from what was actually drawn rather than from the geometry: a
 // cylinder's cap and an actor's arms stick out past the cell they came from.
-function drawioBounds(shapes) {
+function drawioBounds(shapes, measurer) {
     var minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
     for (var i = 0; i < shapes.length; i++) {
         var shape = shapes[i];
@@ -3166,10 +3265,12 @@ function drawioBounds(shapes) {
                 maxY = Math.max(maxY, shape.points[p].y);
             }
         } else if (shape.type === "label") {
-            minX = Math.min(minX, shape.x);
-            maxX = Math.max(maxX, shape.x);
-            minY = Math.min(minY, shape.y);
-            maxY = Math.max(maxY, shape.y);
+            var measured = measurer.size(shape.text, shape.size, shape.bold, shape.mono);
+            var left = shape.x - (shape.align === "trailing" ? measured.width : shape.align === "leading" ? 0 : measured.width / 2);
+            minX = Math.min(minX, left);
+            maxX = Math.max(maxX, left + measured.width);
+            minY = Math.min(minY, shape.y - measured.height / 2);
+            maxY = Math.max(maxY, shape.y + measured.height / 2);
         } else {
             minX = Math.min(minX, shape.x);
             maxX = Math.max(maxX, shape.x + shape.width);

@@ -86,23 +86,11 @@ placing to the plugin, while a `.drawio` file says where every box *is*, because
 dragged it there. So there is no layout step at all — the geometry is read and painted, and
 the arrangement that survives is the author's own, waypoints and all.
 
-What cannot survive is the colour. A `figure` names meanings rather than colours, which is
-what stops a diagram being invisible on somebody's background, so each fill is read as the
-meaning it was probably chosen for: green as `positive`, red as `negative`, amber as
-`warning`, blue as `accent`, anything too pale or too grey as a plain surface. A diagram that
-used colour decoratively comes out quieter than it went in; one that used it to say something
-keeps what it was saying.
-
-The *words* are a different question, and getting it wrong made them disappear. Run through
-the same table as the fills, a label whose file says `fontColor=#7a5ea8` on a box filled
-`#e1d5e7` came out purple on purple — text that is not there at all. Only two pairings in a
-figure's palette are guaranteed legible, so those are the two used: on a coloured fill the
-words are drawn in the *page* colour, since the theme's accent and its string, number and
-comment colours are all chosen to be readable against the page and contrast is symmetric; on
-a plain surface, or with no box at all, they are the ordinary foreground. A mid-grey
-`fontColor` still reads as quiet, because a subtitle written in grey meant to be one — but
-only a mid grey: near-black is what ordinary text is written in on draw.io's white canvas,
-and reading that as "quiet" turned a document's title into a whisper. Shapes it does not know — draw.io ships hundreds of stencils —
+Draw.io previews preserve the file's RGB fill, stroke and font colors on its saved page
+background (white by default). Other preview formats continue to use the editor theme.
+Connector arrowheads use the same stroke color as their shafts. Container backgrounds are
+painted before connectors, so opaque regions do not hide arrows; nodes are painted afterward.
+Shapes it does not know — draw.io ships hundreds of stencils —
 are drawn as labelled rectangles rather than skipped, because a box in the right place still
 says what is connected to what, and skipping it would lose the edges into it too.
 
@@ -157,20 +145,17 @@ What it does **not** do, and each is where a diagram will look plainer than Merm
   writing its XML, and this reads XML. The preview says which switch turns it off — File ▸
   Properties ▸ Compressed — rather than showing an empty page. Files written by current
   draw.io are uncompressed; none of the 90 real files this was built against was compressed.
-- **Colour is a meaning, not a colour** — see above. Five meanings and a surface is the whole
-  palette a preview node has.
+- **Colors use RGB hex values.** Theme palette names remain available to other preview formats.
 - **Stencils are rectangles.** Cylinders, actors, lifelines, notes, documents, hexagons,
   rhombuses, processes and swimlanes are drawn as themselves; a network switch from a stencil
   library is a labelled box.
-- **An edge label goes where the file says, or out of the way.** A label somebody dragged
-  keeps the position draw.io stored for it. A label an edge carries in its own `value` has no
-  stored position and defaults to the middle of the line — which in a crowded diagram is
-  often on top of a box the line passes behind, and the patch of page that keeps the line out
-  of the words would then erase that box's text. So the middle is tried first and then points
-  either side of it, and the first one clear of every node wins. What counts as a node is
-  geometric: a shape with others inside it is a region, whether or not the file makes it
-  their parent, because plenty of diagrams draw the backdrop as an ordinary rectangle with
-  everything laid on top.
+- **Connector routing is an approximation.** Explicit entry/exit points, waypoints,
+  orthogonal routing and rounded elbows are supported. This is not draw.io's full obstacle
+  router. Block, classic, open, diamond and oval markers support size and fill settings;
+  arrowheads have a larger minimum size for readability.
+- **Labels use saved alignment and spacing.** Vertex labels wrap to their available width
+  and reduce their font size when necessary to fit their height. Edge labels retain their
+  saved along-path position, perpendicular distance, offset and font size.
 - **Rich text inside a label is flattened.** `<b>`, `<i>` and the rest are stripped; `<br>`
   and `</div>` become line breaks. A box's *style* can still say bold or italic, and that is
   honoured — it is markup inside the words that is lost.
@@ -204,3 +189,11 @@ rather than imported.
 `figure` with `box`, `ellipse`, `line` (open, closed and filled) and `label` shapes.
 
 Needs API generation 9, which is where `figure` and `measureText` arrive.
+
+### Layout regression checks
+
+Run `node document-preview/label-layout.test.cjs [path/to/example.drawio]` from this
+repository to check label anchors, connector ports, routing and marker shapes. On macOS,
+run `swift document-preview/native-label-layout.test.swift
+"document-preview/Document Preview.linelarkplugin/main.js" path/to/example.drawio`
+to check vertex label containment with JavaScriptCore and native font measurements.
