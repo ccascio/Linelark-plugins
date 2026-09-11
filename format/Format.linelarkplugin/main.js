@@ -107,6 +107,7 @@ var TAB = 9, LF = 10, CR = 13, SPACE = 32;
 var QUOTE = 34, HASH = 35, DOLLAR = 36, APOS = 39, STAR = 42, PLUS = 43, COMMA = 44;
 var MINUS = 45, DOT = 46, SLASH = 47, COLON = 58, SEMI = 59, LT = 60, EQ = 61, GT = 62;
 var QUESTION = 63, AT = 64, BACKSLASH = 92, BACKTICK = 96;
+var PERCENT = 37, AMP = 38, CARET = 94, PIPE = 124;
 var OPEN_BRACKET = 91, CLOSE_BRACKET = 93;
 var OPEN_BRACE = 123, CLOSE_BRACE = 125;
 var OPEN_PAREN = 40, CLOSE_PAREN = 41, BANG = 33;
@@ -1327,31 +1328,114 @@ function formatCSS(text, opt) {
 }
 
 // ---------------------------------------------------------------------------------------
-// §5  Reindent and Tidy — what the other languages get, named for what it is
+// §5  Reindent and Tidy — the whitespace half, for every language
 // ---------------------------------------------------------------------------------------
 //
-// There is no Format for Python, Swift, Go, Rust or C here, and there is no honest way to
-// add one. Formatting those languages means black, swift-format, gofmt and rustfmt: they
-// decide where a line wraps, and reproducing any of them is a program rather than a
-// function. The plugin API has no call that runs one, and the App Store edition is
-// sandboxed, so there is nowhere for such a call to lead even if it existed.
+// There is still no Format here that decides where a line wraps. That is black,
+// swift-format, gofmt and prettier: they are programs, the plugin API has no call that runs
+// one, and the App Store edition is sandboxed, so there would be nowhere for such a call to
+// lead. What this section and §5b build instead are operations that are exactly definable
+// and never move a token across a line boundary, so their names promise what they do and no
+// more:
 //
-// What is offered instead is two operations that are exactly definable and never move a
-// token, so their names promise what they do and no more:
-//
-//   **Reindent** rewrites the leading whitespace of each line from its bracket depth. It is
-//   what Notepad++'s re-indent and Xcode's ⌃I do. It never wraps, never reorders, and never
-//   touches a character that is not leading whitespace.
+//   **Reindent** rewrites the leading whitespace of each line. For a bracket language it
+//   comes from the bracket depth, the way Notepad++'s re-indent and Xcode's ⌃I work; for
+//   Python it comes from the file's own indent stack, because there is nothing else it
+//   could honestly come from. It never wraps and never reorders.
 //
 //   **Tidy** removes whitespace that does nothing: trailing spaces, runs of blank lines, a
 //   missing or repeated final newline. It only ever *removes* whitespace, which is what
 //   makes it safe to offer for every language in the editor.
 //
 // Both rest on one scan that answers, for every line: what construct is open at the start of
-// it, how deep the brackets are, and what its first non-blank character is. A line whose
-// start is inside a string or a block comment is left alone by both — its leading whitespace
-// is content, and stripping the trailing spaces from a line of a here-doc or a `"""` block
-// changes the value of a string.
+// it, how deep the brackets are, whether it sits inside a `switch`, and what its first
+// non-blank character is. A line whose start is inside a string or a block comment is left
+// alone by both — its leading whitespace is content, and stripping the trailing spaces from
+// a line of a here-doc or a `"""` block changes the value of a string.
+
+// Word characters, by code. `$` is one in JavaScript and Swift; anything past ASCII is
+// taken to be one because every language here allows non-ASCII identifiers and none of
+// them mean anything else by such a character outside a string.
+function isWordStart(code) {
+    return (code >= 97 && code <= 122) || (code >= 65 && code <= 90)
+        || code === 95 || code === DOLLAR || code > 127;
+}
+
+function isWordPart(code) {
+    return isWordStart(code) || (code >= 48 && code <= 57);
+}
+
+function isDigit(code) { return code >= 48 && code <= 57; }
+
+// Compares a slice against a literal without cutting one. The scanners below ask this of
+// almost every identifier in the document, and `text.slice(from, to) === "switch"` would
+// allocate a string for each one.
+function wordIs(text, from, to, word) {
+    var n = word.length;
+    if (to - from !== n) { return false; }
+    for (var k = 0; k < n; k++) {
+        if (text.charCodeAt(from + k) !== word.charCodeAt(k)) { return false; }
+    }
+    return true;
+}
+
+// The words after which a value has *not* just ended, per language.
+//
+// Two questions need this and they are the same question. In JavaScript, `/` after a value
+// divides and `/` anywhere else opens a regex — `return /x/` is a pattern and `a / x` is a
+// quotient. In Swift, `-` after a value subtracts and `-` anywhere else is a prefix minus,
+// and Swift cares: `a - b` and `-b` are both legal, `a - b` written as `a -b` is not. The
+// same list then decides where `if (x)` keeps its space and `f(x)` loses it, because a
+// keyword takes an expression and a name takes an argument list.
+//
+// **Per language, rather than one list for all four.** A shared superset looked tempting
+// and is wrong in both directions at once: `delete`, `new` and `repeat` are ordinary names
+// in Swift — `old[head] == new[head]` and `case delete(old: Int)` are real lines from the
+// editor's own source — while `of` is load-bearing in JavaScript's `for (x of ys)`.
+//
+// Value keywords are deliberately absent from every list. `this`, `self`, `super`, `true`,
+// `false`, `null` and `nil` end a value like any identifier, and listing them would read
+// `this / 2` as a regular expression. So are the declaration words that take a parameter
+// list rather than an expression — Swift's `init` and `subscript` — and the access
+// modifiers, because Swift writes `private(set)`.
+var KEYWORD_SETS = {
+    "swift": "if else while for do repeat switch case default break continue return throw "
+        + "throws rethrows try catch guard defer in is as where let var func class struct "
+        + "enum protocol extension import typealias inout",
+    "java": "if else while for do switch case default break continue return throw throws "
+        + "try catch finally new instanceof synchronized assert class interface extends "
+        + "implements import package",
+    // `import` is absent from these two on purpose: JavaScript's dynamic
+    // `import('./x.js')` is a call expression, and a keyword here would push it apart.
+    "javascript.js": "if else while for do switch case default break continue return throw "
+        + "try catch finally new delete typeof instanceof void yield await async in of "
+        + "function class extends export const let var",
+    "typescript": "if else while for do switch case default break continue return throw "
+        + "try catch finally new delete typeof instanceof void yield await async in of "
+        + "function class extends implements export const let var interface"
+};
+
+// The host's own tokenizer pre-digests its keyword table the same way (`LanguageLexicon`):
+// a word can only be a keyword if it is short enough and starts with the right character,
+// and checking that first means the great majority of identifiers are never cut out of the
+// document at all.
+function compileKeywords(words) {
+    var table = { map: {}, first: {}, max: 0 };
+    if (words === undefined) { return table; }
+    var list = words.split(" ");
+    for (var n = 0; n < list.length; n++) {
+        var word = list[n];
+        table.map[word] = 1;
+        table.first[word.charCodeAt(0)] = 1;
+        if (word.length > table.max) { table.max = word.length; }
+    }
+    return table;
+}
+
+function isKeywordAt(text, from, to, table) {
+    if (to - from > table.max || table.first[text.charCodeAt(from)] !== 1) { return false; }
+    return table.map[text.slice(from, to)] === 1;
+}
 
 var S_CODE = 0, S_BLOCK = 1, S_TRIPLE_D = 2, S_TRIPLE_S = 3, S_RAW = 4;
 
@@ -1360,6 +1444,7 @@ var S_CODE = 0, S_BLOCK = 1, S_TRIPLE_D = 2, S_TRIPLE_S = 3, S_RAW = 4;
 var SYNTAX = {
     "c":             { slash: 1, block: 1, hash: 0, quotes: 1, triple: 0, raw: 0, braces: 1 },
     "cpp":           { slash: 1, block: 1, hash: 0, quotes: 1, triple: 0, raw: 0, braces: 1 },
+    "cs":            { slash: 1, block: 1, hash: 0, quotes: 1, triple: 1, raw: 0, braces: 1 },
     "java":          { slash: 1, block: 1, hash: 0, quotes: 1, triple: 1, raw: 0, braces: 1 },
     "javascript.js": { slash: 1, block: 1, hash: 0, quotes: 1, triple: 0, raw: 1, braces: 1 },
     "typescript":    { slash: 1, block: 1, hash: 0, quotes: 1, triple: 0, raw: 1, braces: 1 },
@@ -1370,7 +1455,7 @@ var SYNTAX = {
     "php":           { slash: 1, block: 1, hash: 1, quotes: 1, triple: 0, raw: 0, braces: 1 },
     "css":           { slash: 1, block: 1, hash: 0, quotes: 1, triple: 0, raw: 0, braces: 1 },
     "json":          { slash: 0, block: 0, hash: 0, quotes: 1, triple: 0, raw: 0, braces: 1 },
-    "python":        { slash: 0, block: 0, hash: 1, quotes: 1, triple: 1, raw: 0, braces: 0 },
+    "python":        { slash: 0, block: 0, hash: 1, quotes: 1, triple: 1, raw: 0, braces: 1 },
     "ruby":          { slash: 0, block: 0, hash: 1, quotes: 1, triple: 0, raw: 0, braces: 0 },
     "bash":          { slash: 0, block: 0, hash: 1, quotes: 1, triple: 0, raw: 0, braces: 0 },
     "yaml":          { slash: 0, block: 0, hash: 1, quotes: 1, triple: 0, raw: 0, braces: 0 },
@@ -1379,31 +1464,155 @@ var SYNTAX = {
     "html":          { slash: 0, block: 0, hash: 0, quotes: 0, triple: 0, raw: 0, braces: 0 }
 };
 
+// The second half of the same table, kept apart because it is about *code* rather than
+// about what crosses a newline, and because only a handful of languages set any of it.
+//
+//   `words`      identifiers are read as words rather than character by character — which
+//                is what makes the three facts below knowable, and is faster besides.
+//   `regex`      `/` in a position where no value has just ended opens a pattern.
+//   `rawHash`    Swift's `#"…"#`, where the delimiter is the quote plus its hashes.
+//   `apos`       `'` opens a string. Swift is the exception: it has no such literal, so a
+//                stray apostrophe there must not swallow the rest of the line.
+//   `tick`       a backtick quotes an identifier (Swift's `` `default` ``) rather than
+//                opening a template literal.
+//   `caseStyle`  1 puts `case` at the `switch`'s own level, which is Swift and Xcode;
+//                2 puts it one level in and its body one further, which is everyone else.
+//   `chain`      a line starting with `.` continues the line above it.
+var CODE_FACTS = {
+    "c":             { words: 1, caseStyle: 2 },
+    "cpp":           { words: 1, caseStyle: 2, chain: 1 },
+    "cs":            { words: 1, caseStyle: 2, chain: 1 },
+    "java":          { words: 1, caseStyle: 2, chain: 1 },
+    "javascript.js": { words: 1, caseStyle: 2, chain: 1, regex: 1 },
+    "typescript":    { words: 1, caseStyle: 2, chain: 1, regex: 1 },
+    "swift":         { words: 1, caseStyle: 1, chain: 1, rawHash: 1, apos: 0, tick: 1 },
+    "kotlin":        { words: 1, caseStyle: 0, chain: 1 },
+    "go":            { words: 1, caseStyle: 2, chain: 1 },
+    "rust":          { words: 1, caseStyle: 0, chain: 1 },
+    "php":           { words: 1, caseStyle: 2, chain: 1 },
+    "python":        { words: 1 }
+};
+
+// Every entry ends up the same shape, filled in once at load. A scanner that meets one
+// hidden class for `syn` is the one that stays fast; an object that gained a property
+// halfway through the table would not be that.
+(function () {
+    var extras = ["words", "regex", "rawHash", "caseStyle", "chain", "tick"];
+    for (var id in SYNTAX) {
+        if (!Object.prototype.hasOwnProperty.call(SYNTAX, id)) { continue; }
+        var syn = SYNTAX[id];
+        var facts = CODE_FACTS[id];
+        for (var n = 0; n < extras.length; n++) {
+            var name = extras[n];
+            syn[name] = facts !== undefined && facts[name] !== undefined ? facts[name] : 0;
+        }
+        syn.apos = facts !== undefined && facts.apos !== undefined ? facts.apos : 1;
+        syn.keywords = compileKeywords(KEYWORD_SETS[id]);
+    }
+}());
+
 // A file the editor could not place. Nothing is assumed to span a line, which makes Tidy
 // behave as a plain whitespace pass — the only safe reading when the grammar is unknown.
-var SYNTAX_PLAIN = { slash: 0, block: 0, hash: 0, quotes: 0, triple: 0, raw: 0, braces: 0 };
+var SYNTAX_PLAIN = { slash: 0, block: 0, hash: 0, quotes: 0, triple: 0, raw: 0, braces: 0,
+                     words: 0, regex: 0, rawHash: 0, caseStyle: 0, chain: 0, tick: 0,
+                     apos: 1, keywords: compileKeywords() };
 
 function syntaxFor(languageID) {
     var found = SYNTAX[languageID];
     return found === undefined ? SYNTAX_PLAIN : found;
 }
 
+// The end of a regular expression literal, or `-1` when it does not close on this line.
+//
+// A pattern cannot span a newline, so failing to close on the line is proof this `/` was
+// not one — which is the backstop that keeps a mistaken guess from swallowing the rest of
+// the file. `[` opens a character class, and `/` inside one is an ordinary character.
+function endOfRegex(text, i, len) {
+    i++;
+    var inClass = false;
+    while (i < len) {
+        var code = text.charCodeAt(i);
+        if (code === LF || code === CR) { return -1; }
+        if (code === BACKSLASH) { i += 2; continue; }
+        if (inClass) {
+            if (code === CLOSE_BRACKET) { inClass = false; }
+            i++;
+            continue;
+        }
+        if (code === OPEN_BRACKET) { inClass = true; i++; continue; }
+        if (code === SLASH) {
+            i++;
+            while (i < len && isWordPart(text.charCodeAt(i))) { i++; }   // the flags
+            return i;
+        }
+        i++;
+    }
+    return -1;
+}
+
 // One pass. Per line: the offset it starts at, the offset its text ends at (before any CR
 // or LF, so the file's own line endings survive untouched), what was open at its start, the
-// bracket depth at its start, and its first non-blank character.
+// bracket depth at its start, its first non-blank character, and — for a language with a
+// `switch` worth indenting — how many `switch` bodies enclose it and whether the innermost
+// brace is one.
+//
+// **Indentation is counted per line, not per bracket.** `defineConfig({` opens two and
+// means one: every editor indents its body a single level, and a scan that counted both
+// would bring a two-space file back at eight — which is the shape of nearly every
+// JavaScript config file there is. So a bracket opened on a line that already has one open
+// gives the same level as that one, and the level a line gets is the level of the bracket
+// it sits inside. A line *starting* with a closer gets the level of the line its bracket
+// was opened on, which is the same rule read from the other end and replaces the older
+// "take one off for a leading `}`".
+//
+// This is the pass Tidy runs on every file in the editor, so it is written to be cheap
+// rather than to be exact: the character classes are spelt out inline rather than called,
+// the language's facts are pulled into locals before the loop, and a word is read as a word
+// because skipping one is faster than stepping through it. What it does *not* do is decide
+// what a token means — that is §5b's tokenizer, which costs more and is asked only by
+// Format. The one thing it has to get right is what crosses a line, and `tests/fuzz-code.js`
+// checks the two against each other.
 function scanLines(text, syn) {
     var len = text.length;
-    var start = [], stop = [], state = [], depth = [], first = [];
+    var start = [], stop = [], state = [], depth = [], first = [], level = [];
+    var swInfo = syn.caseStyle > 0 ? [] : null;
     var lines = 0;
     var s = S_CODE;
     var d = 0;
+    var h = 0;                  // the `#` count a Swift raw string must be closed with
     var i = 0;
+    var frames = [];            // one entry per open `{`: 1 when a `switch` opened it
+    var switches = 0;           // how many of those are switch frames
+    var pendingSwitch = 0;      // a `switch` has been read; the next `{` is its body
+    var value = 0;              // 1 when the token just read could end a value
+    var wordFrom = 0, wordTo = 0;   // the last word, for the one question that needs it
+    // One entry per open bracket of any kind: the level its contents take, the level its
+    // closing line takes, and the line it was opened on.
+    var bInner = [], bOuter = [], bLine = [];
+    var bTop = -1;
+    var lineLevel = 0;
+    // The level *partway along* the line, which is not the level the line is drawn at once
+    // a bracket has closed on it. `if (a\n && b) {` opens its body after the condition's
+    // `)` has gone, so the body is one level from the `if` and not one from the condition.
+    var current = 0;
+
+    var slash = syn.slash, block = syn.block, hash = syn.hash, quotes = syn.quotes;
+    var triple = syn.triple, raw = syn.raw, braces = syn.braces, words = syn.words;
+    var regex = syn.regex, rawHash = syn.rawHash, apos = syn.apos, tick = syn.tick;
+    var tracksSwitch = syn.caseStyle > 0;
+    var keywords = syn.keywords;
 
     for (;;) {
         start[lines] = i;
         state[lines] = s;
         depth[lines] = d;
+        if (swInfo !== null) {
+            swInfo[lines] = switches * 2
+                + (frames.length > 0 && frames[frames.length - 1] === 1 ? 1 : 0);
+        }
         var firstCode = 0;
+        lineLevel = bTop >= 0 ? bInner[bTop] : 0;
+        current = lineLevel;
 
         while (i < len) {
             var code = text.charCodeAt(i);
@@ -1411,6 +1620,11 @@ function scanLines(text, syn) {
 
             if (firstCode === 0 && code !== SPACE && code !== TAB && code !== CR) {
                 firstCode = code;
+                if (bTop >= 0 && (code === CLOSE_BRACE || code === CLOSE_BRACKET
+                                  || code === CLOSE_PAREN)) {
+                    lineLevel = bOuter[bTop];
+                    current = lineLevel;
+                }
             }
 
             if (s === S_BLOCK) {
@@ -1420,51 +1634,137 @@ function scanLines(text, syn) {
             }
             if (s === S_TRIPLE_D || s === S_TRIPLE_S) {
                 var mark = s === S_TRIPLE_D ? QUOTE : APOS;
-                if (code === BACKSLASH) { i += 2; continue; }
+                if (code === BACKSLASH && h === 0) { i += 2; continue; }
                 if (code === mark && text.charCodeAt(i + 1) === mark
-                    && text.charCodeAt(i + 2) === mark) { s = S_CODE; i += 3; }
-                else { i++; }
+                    && text.charCodeAt(i + 2) === mark && closingHashes(text, i + 3, h)) {
+                    s = S_CODE; i += 3 + h; h = 0; value = 1;
+                } else { i++; }
                 continue;
             }
             if (s === S_RAW) {
                 if (code === BACKSLASH) { i += 2; continue; }
-                if (code === BACKTICK) { s = S_CODE; i++; }
+                if (code === BACKTICK) { s = S_CODE; i++; value = 1; }
                 else { i++; }
                 continue;
             }
 
-            // S_CODE.
-            if (syn.slash === 1 && code === SLASH) {
+            // S_CODE. A word first, because in code most characters are one.
+            if (words === 1 && ((code >= 97 && code <= 122) || (code >= 65 && code <= 90)
+                                || code === 95 || code === DOLLAR || code > 127)) {
+                wordFrom = i;
+                i++;
+                while (i < len) {
+                    var wc = text.charCodeAt(i);
+                    if ((wc >= 97 && wc <= 122) || (wc >= 65 && wc <= 90)
+                        || (wc >= 48 && wc <= 57) || wc === 95 || wc === DOLLAR
+                        || wc > 127) { i++; continue; }
+                    break;
+                }
+                wordTo = i;
+                if (tracksSwitch && code === 115 && wordIs(text, wordFrom, i, "switch")) {
+                    pendingSwitch = 1;
+                }
+                value = 2;                  // a value, and the last token was a word
+                continue;
+            }
+            if (slash === 1 && code === SLASH) {
                 var after = text.charCodeAt(i + 1);
                 if (after === SLASH) { break; }                 // rest of the line
-                if (syn.block === 1 && after === STAR) { s = S_BLOCK; i += 2; continue; }
+                if (block === 1 && after === STAR) { s = S_BLOCK; i += 2; continue; }
+                // The one question a keyword is asked, and the reason the word above was
+                // remembered rather than classified: `return /x/` is a pattern and `a / x`
+                // is a quotient, and patterns are rare enough that cutting every identifier
+                // out of the document to find out would be paying for this everywhere.
+                if (regex === 1 && (value === 0
+                        || (value === 2 && isKeywordAt(text, wordFrom, wordTo, keywords)))) {
+                    var closed = endOfRegex(text, i, len);
+                    if (closed > 0) { i = closed; value = 1; continue; }
+                }
+                value = 0;
+                i++;
+                continue;
             }
-            if (syn.hash === 1 && code === HASH) { break; }     // rest of the line
-            if (syn.raw === 1 && code === BACKTICK) { s = S_RAW; i++; continue; }
-            if (syn.quotes === 1 && (code === QUOTE || code === APOS)) {
-                if (syn.triple === 1 && text.charCodeAt(i + 1) === code
+            if (hash === 1 && code === HASH) { break; }         // rest of the line
+            if (rawHash === 1 && code === HASH) {
+                var opened = openingHashes(text, i);
+                if (opened > 0) {
+                    h = opened;
+                    i += opened;
+                    if (text.charCodeAt(i + 1) === QUOTE && text.charCodeAt(i + 2) === QUOTE) {
+                        s = S_TRIPLE_D;
+                        i += 3;
+                    } else {
+                        i = endOfSimpleString(text, i, len, QUOTE, h);
+                        h = 0;
+                        value = 1;
+                    }
+                    continue;
+                }
+                value = 0;
+                i++;
+                continue;
+            }
+            if (raw === 1 && code === BACKTICK) { s = S_RAW; i++; continue; }
+            if (tick === 1 && code === BACKTICK) {
+                i++;
+                while (i < len && text.charCodeAt(i) !== BACKTICK
+                       && text.charCodeAt(i) !== LF) { i++; }
+                if (i < len && text.charCodeAt(i) === BACKTICK) { i++; }
+                value = 1;
+                continue;
+            }
+            if (quotes === 1 && (code === QUOTE || (code === APOS && apos === 1))) {
+                if (triple === 1 && text.charCodeAt(i + 1) === code
                     && text.charCodeAt(i + 2) === code) {
                     s = code === QUOTE ? S_TRIPLE_D : S_TRIPLE_S;
+                    h = 0;
                     i += 3;
                     continue;
                 }
                 // A string that cannot reach the next line. An unclosed one ends at the
                 // line break, which is what an editor shows and what a compiler reports.
-                i++;
-                while (i < len) {
-                    var inner = text.charCodeAt(i);
-                    if (inner === LF) { break; }
-                    if (inner === BACKSLASH) { i += 2; continue; }
-                    if (inner === code) { i++; break; }
-                    i++;
-                }
+                i = endOfSimpleString(text, i, len, code, 0);
+                value = 1;
                 continue;
             }
-            if (syn.braces === 1) {
-                if (code === OPEN_BRACE || code === OPEN_BRACKET || code === OPEN_PAREN) { d++; }
-                else if (code === CLOSE_BRACE || code === CLOSE_BRACKET
-                         || code === CLOSE_PAREN) { d--; if (d < 0) { d = 0; } }
+            if (braces === 1) {
+                if (code === OPEN_BRACE || code === OPEN_BRACKET || code === OPEN_PAREN) {
+                    var sameLine = bTop >= 0 && bLine[bTop] === lines;
+                    var inner = sameLine ? bInner[bTop] : current + 1;
+                    var outer = sameLine ? bOuter[bTop] : current;
+                    bTop++;
+                    bInner[bTop] = inner;
+                    bOuter[bTop] = outer;
+                    bLine[bTop] = lines;
+                    if (code === OPEN_BRACE) {
+                        frames[frames.length] = pendingSwitch;
+                        if (pendingSwitch === 1) { switches++; }
+                        pendingSwitch = 0;
+                    }
+                    d++;
+                    value = 0;
+                    i++;
+                    continue;
+                }
+                if (code === CLOSE_BRACE || code === CLOSE_BRACKET
+                    || code === CLOSE_PAREN) {
+                    if (bTop >= 0) { current = bOuter[bTop]; bTop--; }
+                    if (code === CLOSE_BRACE && frames.length > 0) {
+                        if (frames[frames.length - 1] === 1) { switches--; }
+                        frames.length = frames.length - 1;
+                    }
+                    d--; if (d < 0) { d = 0; }
+                    value = code === CLOSE_BRACE ? 0 : 1;
+                    i++;
+                    continue;
+                }
             }
+            if (code === SEMI) { pendingSwitch = 0; }
+            // A digit is left to fall through: the only thing a number has to settle here
+            // is that a value ended at it, and the rest of `0x1f` or `1.5e-3` is read as a
+            // word and a dot and lands on the same answer.
+            if (code >= 48 && code <= 57) { value = 1; }
+            else if (code !== SPACE && code !== TAB && code !== CR) { value = 0; }
             i++;
         }
 
@@ -1475,6 +1775,7 @@ function scanLines(text, syn) {
         if (end > start[lines] && text.charCodeAt(end - 1) === CR) { end--; }
         stop[lines] = end;
         first[lines] = firstCode;
+        level[lines] = lineLevel;
         lines++;
 
         if (i >= len) { break; }
@@ -1482,32 +1783,116 @@ function scanLines(text, syn) {
     }
 
     return { start: start, stop: stop, state: state, depth: depth, first: first,
-             count: lines };
+             level: level, swInfo: swInfo, count: lines };
 }
 
-// Which languages have a bracket depth worth indenting from. Python is deliberately absent:
-// its indentation *is* its block structure, so recomputing it from brackets would not
-// reformat the file, it would rewrite what the program does.
+// A Swift raw string opens with one or more `#` and a quote, and closes with the quote and
+// exactly as many again — which is the whole point of it, since `"#` inside is then text.
+function openingHashes(text, i) {
+    var n = 0;
+    while (text.charCodeAt(i + n) === HASH) { n++; }
+    return n > 0 && text.charCodeAt(i + n) === QUOTE ? n : 0;
+}
+
+function closingHashes(text, i, want) {
+    for (var n = 0; n < want; n++) {
+        if (text.charCodeAt(i + n) !== HASH) { return false; }
+    }
+    return true;
+}
+
+// Past a one-line string. `want` is the raw string's hash count: zero for an ordinary
+// literal, in which case a backslash escapes and the closing quote is the bare one.
+//
+// `strict` is the difference between the two callers. Reindent and Tidy take the line break
+// as the end of an unclosed string, which is what the editor draws and what a compiler
+// reports, and carry on scanning the file; Format refuses it, because a file with a string
+// open at the end of a line is one whose tokens it cannot be sure of.
+function endOfSimpleString(text, i, len, mark, want, strict) {
+    var from = i;
+    i++;
+    while (i < len) {
+        var code = text.charCodeAt(i);
+        if (code === LF) { break; }
+        if (code === BACKSLASH && want === 0) { i += 2; continue; }
+        if (code === mark && closingHashes(text, i + 1, want)) { return i + 1 + want; }
+        i++;
+    }
+    if (strict === true) { refuse("A string opened here is never closed.", from); }
+    return i;
+}
+
+// Past a numeric literal, in any of the spellings these languages allow: `0x1F`, `1_000`,
+// `1.5e-3`, `0b1010`, `10L`, `1.0f`. The dot is taken only when a digit follows it, so
+// Swift's `0..<5` is a number, a range operator and a number rather than one long mistake.
+function endOfCodeNumber(text, i, len) {
+    i++;
+    while (i < len) {
+        var code = text.charCodeAt(i);
+        if (isWordPart(code)) {
+            var isExponent = code === 101 || code === 69 || code === 112 || code === 80;
+            i++;
+            if (isExponent) {
+                var sign = text.charCodeAt(i);
+                if (sign === PLUS || sign === MINUS) { i++; }
+            }
+            continue;
+        }
+        if (code === DOT && isDigit(text.charCodeAt(i + 1))) { i += 2; continue; }
+        break;
+    }
+    return i;
+}
+
+// Which languages have a bracket depth worth indenting from — plus Python, which is routed
+// to a different algorithm entirely rather than to this one.
 var REINDENTABLE = {
-    "c": 1, "cpp": 1, "java": 1, "javascript.js": 1, "typescript": 1, "swift": 1,
-    "kotlin": 1, "go": 1, "rust": 1, "php": 1, "css": 1, "json": 1
+    "c": 1, "cpp": 1, "cs": 1, "java": 1, "javascript.js": 1, "typescript": 1, "swift": 1,
+    "kotlin": 1, "go": 1, "rust": 1, "php": 1, "css": 1, "json": 1, "python": 1
 };
 
+// A `case` or `default` opening a line. Only asked inside a `switch` body, which is what
+// keeps it away from Swift's `enum E { case a }` and from a variable that happens to be
+// called `defaults`.
+function isCaseLabel(text, from, to) {
+    if (to - from >= 4 && wordIs(text, from, from + 4, "case")
+        && !isWordPart(text.charCodeAt(from + 4))) {
+        return true;
+    }
+    return to - from >= 7 && wordIs(text, from, from + 7, "default")
+        && !isWordPart(text.charCodeAt(from + 7));
+}
+
+// Does this line begin with something that cannot begin a statement? `&` and `|` count
+// only doubled, and `-` only as `->`: on their own they are Swift's inout marker and C++'s
+// pointer arithmetic, and a line may legitimately start with either. `*` is left out for
+// the same reason — `*p = 1;` is a statement.
+function isContinuationHead(text, from, to) {
+    var head = text.charCodeAt(from);
+    if (head === QUESTION || head === COLON || head === COMMA || head === PLUS
+        || head === EQ || head === PERCENT) { return true; }
+    var next = from + 1 < to ? text.charCodeAt(from + 1) : 0;
+    if (head === AMP || head === PIPE) { return next === head; }
+    if (head === MINUS) { return next === GT; }
+    return false;
+}
+
 function reindent(text, languageID, opt) {
+    if (languageID === "python") { return reindentPython(text, opt); }
     if (REINDENTABLE[languageID] !== 1) {
-        var syn = SYNTAX[languageID];
-        if (languageID === "python") {
-            refuse("Python's indentation is its block structure, so it cannot be worked out "
-                   + "from brackets. Tidy Whitespace is the safe one here.", -1);
-        }
+        var unknown = SYNTAX[languageID];
         refuse("Reindent needs a language whose blocks are brackets. This one is "
-               + (syn === undefined ? "not one the editor knows" : "not written that way")
+               + (unknown === undefined ? "not one the editor knows" : "not written that way")
                + ".", -1);
     }
 
-    var lines = scanLines(text, syntaxFor(languageID));
+    var syn = syntaxFor(languageID);
+    var lines = scanLines(text, syn);
     var ind = new Indents(opt.unit, opt.newline);
     var out = new Out();
+    var prevLevel = 0;
+    var prevHead = 0;
+    var prevCarried = false;
 
     for (var n = 0; n < lines.count; n++) {
         var from = lines.start[n];
@@ -1526,25 +1911,219 @@ function reindent(text, languageID, opt) {
         }
         if (lines.first[n] === 0) { continue; }                 // blank; emit nothing
 
-        var level = lines.depth[n];
-        var head = lines.first[n];
-        // A line beginning with a closing bracket belongs to the level it closes, not to
-        // the one inside it. Without this every `}` sits one level too deep.
-        if (head === CLOSE_BRACE || head === CLOSE_BRACKET || head === CLOSE_PAREN) {
-            level--;
-        }
-        if (level < 0) { level = 0; }
-
         var body = from;
         while (body < to) {
             var lead = text.charCodeAt(body);
             if (lead !== SPACE && lead !== TAB) { break; }
             body++;
         }
+
+        var head = lines.first[n];
+        var closer = head === CLOSE_BRACE || head === CLOSE_BRACKET || head === CLOSE_PAREN;
+        var level = lines.level[n];
+
+        // A `switch` body is the one place bracket depth is not the whole answer, and the
+        // two conventions differ by which half of the pair moves. Swift and Xcode leave the
+        // body where the brackets put it and pull the labels out to the `switch`; C, Java,
+        // JavaScript and TypeScript leave the labels one level in and push the body past
+        // them. Both are "one level between the label and its statements" — written from
+        // opposite ends.
+        if (syn.caseStyle > 0) {
+            var info = lines.swInfo[n];
+            var topIsSwitch = (info & 1) === 1;
+            if (syn.caseStyle === 2) {
+                level += info >> 1;                             // one per enclosing switch
+                if (closer && head === CLOSE_BRACE && topIsSwitch) { level--; }
+            }
+            if (!closer && topIsSwitch && isCaseLabel(text, body, to)) { level--; }
+        }
+        if (level < 0) { level = 0; }
+
+        // A line that starts with `.` — or with any other operator that cannot begin a
+        // statement — is the rest of the line above it: a SwiftUI modifier, a stream, a
+        // promise chain, the second half of a wrapped condition, the `: otherwise` of a
+        // ternary. The brackets say nothing about any of them, because none of them opened
+        // one. It goes one level in from whatever began the run and stays there for the
+        // rest of it; a run hanging off a closing bracket keeps that bracket's level, which
+        // is what `}` followed by `.padding()` wants.
+        //
+        // A comment in the middle of a chain is not a link in it and must not be read as
+        // one — `}`, four lines saying why, and then `.overlay(...)` is ordinary SwiftUI,
+        // and treating the comment as what the chain hangs off would step every modifier
+        // under it one level in. So a comment line is passed over here, and takes the
+        // chain's own level when there is a chain in progress to take.
+        var comment = head === SLASH
+            && (text.charCodeAt(body + 1) === SLASH || text.charCodeAt(body + 1) === STAR);
+        var carries = head === DOT || isContinuationHead(text, body, to);
+        if (syn.chain === 1 && (carries || comment) && prevHead !== 0) {
+            var chain = prevCarried || prevHead === CLOSE_BRACE
+                || prevHead === CLOSE_BRACKET || prevHead === CLOSE_PAREN
+                ? prevLevel : prevLevel + 1;
+            if (comment) { chain = prevCarried ? prevLevel : level; }
+            if (chain > level) { level = chain; }
+        }
+
         out.add(ind.at(level));
         out.add(text.slice(body, to));
+        if (!comment) {
+            prevLevel = level;
+            prevHead = head;
+            prevCarried = carries;
+        }
     }
     return out.done();
+}
+
+// ---------------------------------------------------------------------------------------
+//
+// Python. Its indentation *is* its block structure, so there is nothing to recompute it
+// from — which is why this is a different algorithm rather than a flag on the one above.
+// What it can do is restate the structure the file already has in the unit that was asked
+// for: read the indent stack the way Python reads it, and re-emit each statement at the
+// depth that stack puts it on. Three spaces become four, tabs become spaces, an over-
+// indented block comes back in line, and no statement changes which block it is in.
+//
+// Two things are deliberately not touched. A **continuation line** — inside brackets, or
+// after a `\` — is shifted by the same number of columns as the statement it belongs to,
+// never re-indented: its whitespace is usually alignment to a column, and rebuilding it
+// from a depth would destroy that. A **comment on its own line** is put at the depth of the
+// nearest enclosing block it fits in, without touching the stack, because a comment is
+// allowed at any indentation and must not be read as a dedent.
+//
+// It refuses two files rather than guess at them. One that dedents to a column no
+// enclosing block is on is what Python itself calls an IndentationError. One whose
+// indentation means different things depending on whether a tab is one column or eight is
+// a TabError, and comparing under both readings is how CPython decides that too.
+function reindentPython(text, opt) {
+    var lines = scanLines(text, syntaxFor("python"));
+    var ind = new Indents(opt.unit, opt.newline);
+    var out = new Out();
+    var unitColumns = opt.unit === "\t" ? 8 : opt.unit.length;
+
+    var stack1 = [0], stack8 = [0];
+    var delta = 0;              // columns the statement in hand moved, for its continuations
+    var continued = false;      // the line before ended with a backslash
+
+    // A comment is held back until the statement below it has been placed, because that is
+    // the statement it is about — and because the stack cannot answer for it yet. `# note`
+    // sitting above the first line of a block is indented like that line, and the block it
+    // opens has not been pushed at the moment the comment is read.
+    var held = [];
+
+    // The deepest block this column could belong to, for a comment that is indented past
+    // the statement below it — a note at the end of a body, above the line that leaves it.
+    function nearestFitting(width) {
+        var at = stack8.length - 1;
+        while (at > 0 && stack8[at] > width) { at--; }
+        return at;
+    }
+
+    // `width` of -1 means there is no statement below: every held comment falls back to the
+    // block it fits in.
+    function release(depth, width) {
+        for (var k = 0; k < held.length; k++) {
+            var rec = held[k];
+            out.add(rec.lead);
+            if (rec.to === 0) { continue; }                     // a blank line
+            out.add(ind.at(rec.width > width ? rec.nearest : depth));
+            out.add(text.slice(rec.from, rec.to));
+        }
+        held.length = 0;
+    }
+
+    for (var n = 0; n < lines.count; n++) {
+        var from = lines.start[n];
+        var to = lines.stop[n];
+        var lead = n > 0 ? text.slice(lines.stop[n - 1], from) : "";
+
+        if (lines.state[n] !== S_CODE) {                        // inside a `"""` block
+            release(-1, -1);
+            out.add(lead);
+            out.add(text.slice(from, to));
+            continued = false;
+            continue;
+        }
+        if (lines.first[n] === 0) {                             // blank; emit no body
+            if (held.length > 0) {
+                held[held.length] = { lead: lead, from: 0, to: 0, width: 0, nearest: 0 };
+            } else {
+                out.add(lead);
+            }
+            continue;
+        }
+
+        var body = from;
+        var wide1 = 0, wide8 = 0;
+        while (body < to) {
+            var ch = text.charCodeAt(body);
+            if (ch === SPACE) { wide1++; wide8++; }
+            else if (ch === TAB) { wide1++; wide8 = (Math.floor(wide8 / 8) + 1) * 8; }
+            else { break; }
+            body++;
+        }
+
+        var isContinuation = lines.depth[n] > 0 || continued;
+        continued = text.charCodeAt(to - 1) === BACKSLASH;
+
+        if (isContinuation) {
+            // Shifted with its statement, or left exactly as it was when the statement did
+            // not move. Spaces, because the shift is a column count and a tab is only a
+            // column count by convention.
+            release(-1, -1);
+            out.add(lead);
+            if (delta === 0) {
+                out.add(text.slice(from, to));
+            } else {
+                out.add(spaces(wide8 + delta > 0 ? wide8 + delta : 0));
+                out.add(text.slice(body, to));
+            }
+            continue;
+        }
+
+        if (lines.first[n] === HASH) {
+            held[held.length] = { lead: lead, from: body, to: to, width: wide8,
+                                  nearest: nearestFitting(wide8) };
+            continue;
+        }
+
+        var top = stack8.length - 1;
+        if (wide8 > stack8[top]) {
+            if (wide1 <= stack1[top]) {
+                refuse("This line's indentation means one thing if a tab is one column and "
+                       + "another if it is eight, so there is no safe way to read it.", body);
+            }
+            stack8[stack8.length] = wide8;
+            stack1[stack1.length] = wide1;
+        } else {
+            while (stack8.length > 1 && wide8 < stack8[stack8.length - 1]) {
+                stack8.length = stack8.length - 1;
+                stack1.length = stack1.length - 1;
+            }
+            if (wide8 !== stack8[stack8.length - 1]) {
+                refuse("This line is indented less than the block it is in, but not out to "
+                       + "any block around it — Python reads that as an error too.", body);
+            }
+            if (wide1 !== stack1[stack1.length - 1]) {
+                refuse("This line's indentation means one thing if a tab is one column and "
+                       + "another if it is eight, so there is no safe way to read it.", body);
+            }
+        }
+
+        var depth = stack8.length - 1;
+        delta = depth * unitColumns - wide8;
+        release(depth, wide8);
+        out.add(lead);
+        out.add(ind.at(depth));
+        out.add(text.slice(body, to));
+    }
+    release(-1, -1);
+    return out.done();
+}
+
+function spaces(n) {
+    var out = "";
+    for (var i = 0; i < n; i++) { out += " "; }
+    return out;
 }
 
 // Tidy. Only ever removes whitespace — which is what lets it run on any file the editor can
@@ -1626,6 +2205,543 @@ function tidy(text, languageID) {
 }
 
 // ---------------------------------------------------------------------------------------
+// §5b  Spacing, for Swift, Java, JavaScript and TypeScript
+// ---------------------------------------------------------------------------------------
+//
+// **Format Document** for these four is Reindent plus this: the whitespace *between* two
+// tokens on a line, rewritten from the pair itself. It never breaks a line, never joins
+// two, never moves a token past another, and never reads a token as anything but the token
+// it is. What it changes is `f(a ,b)` into `f(a, b)` and `x=1` into `x = 1`.
+//
+// The rule it is built around is the one the CSS formatter is built around, for the same
+// reason: **a run of whitespace collapses to a single space, and nothing else moves —
+// except where the two tokens either side settle the question between them.** Two lists
+// settle it, and everything outside them is left as written. That is why `a<b` comes back
+// as `a<b` while `a=b` comes back as `a = b`.
+//
+// **An operator is spaced only where it is infix.** Swift is why. `a - b` and `-b` are both
+// Swift; `a -b` is not, because an operator with whitespace on one side only is read as a
+// prefix or postfix one. So putting a space around every `-` would turn `let y = -x` into
+// something that does not compile. An operator is infix when a value has just ended — an
+// identifier, a number, a string, a `)` or a `]` — and prefix otherwise, which is also how
+// the scanner tells `str.replace(/}/g, "")` from `a / b`. The two questions have one
+// answer, and `KEYWORDS` in §5 is the list that makes it right: after `return`, `case` or
+// `as` no value has ended, so the operator after one of them is never touched.
+//
+// **Nothing beginning with `<` or `>` is ever spaced.** `<` opens a generic parameter list
+// as readily as it compares, and `Map<String, List<String>> m` has three of them and no
+// comparison at all. Telling those apart needs a type checker, so `<`, `>`, `<=`, `>=`,
+// `<<` and `>>` are left exactly as they were written — and `Array<number>= []`, which
+// reads as `>=` to a scanner, is left alone rather than rewritten into `Array<number >= []`.
+//
+// **`:` is three tokens wearing one character**, so it is the other place a single wrong
+// guess would be expensive: a type annotation, an object key, a `case` label and a
+// ternary's second half are all `:`. The first three want no space in front of them and one
+// behind; the ternary wants one on each side. They are told apart by counting: a `?` that
+// opens a ternary is remembered against its bracket depth, and the next `:` at that depth
+// answers it. A `?` is only counted when a value has just ended and what follows is not
+// `)`, `,`, `:`, `=` or the end of the line — which is what keeps Swift's `Int?`, `x?.y`,
+// `try?` and `as?` out of it. The count belongs to the depth it was opened at and is
+// dropped by a `;` at that depth, so a ternary survives both `a ? f { x } : b` and a line
+// break in the middle of itself without reaching across a statement.
+//
+// **Strings and comments are copied out exactly**, including a multi-line one — a template
+// literal, a `"""` block, a Swift `#"…"#`. This is the markup formatter's rule about an
+// element's own text, and the reason is the same: the inside of a string is not whitespace
+// to be tidied, it is the value of something.
+//
+// **A file whose brackets do not balance is refused.** Reindent is best-effort on anything
+// and clamps a stray `}` to the left margin; Format is not, because respacing a file the
+// scanner cannot account for is the case where a quiet mistake spreads over the whole
+// document.
+
+var K_NONE = 0, K_WORD = 1, K_KEYWORD = 2, K_NUMBER = 3, K_STRING = 4, K_REGEX = 5;
+var K_COMMENT = 6, K_OPEN = 7, K_CLOSE = 8, K_OP = 9;
+var K_COMMA = 10, K_SEMI = 11, K_COLON = 12, K_DOT = 13, K_ATTRIBUTE = 14;
+
+// Every operator these four languages spell with more than one character, so that `a=-b`
+// is read as `=` and `-` rather than as one operator nobody wrote.
+var OPERATORS = {
+    ">>>=": 1,
+    "===": 1, "!==": 1, "**=": 1, "&&=": 1, "||=": 1, "??=": 1, "<<=": 1, ">>=": 1,
+    ">>>": 1, "...": 1, "..<": 1,
+    "==": 1, "!=": 1, "<=": 1, ">=": 1, "&&": 1, "||": 1, "??": 1, "+=": 1, "-=": 1,
+    "*=": 1, "/=": 1, "%=": 1, "&=": 1, "|=": 1, "^=": 1, "**": 1, "<<": 1, ">>": 1,
+    "->": 1, "=>": 1, "?.": 1, "::": 1, "++": 1, "--": 1, "..": 1
+};
+
+// Swift's overflow operators, which wrap rather than trap. They matter here because `&+=`
+// spelt as `&` and `+=` is two forced operators and comes back as `token & += 1` — which
+// is not Swift. They are Swift's alone: in JavaScript `a &+b` is `a & (+b)`, so reading the
+// two characters as one operator there would be the same mistake in the other direction.
+var SWIFT_OPERATORS = { "&+": 1, "&-": 1, "&*": 1, "&+=": 1, "&-=": 1, "&*=": 1, "&<<": 1,
+                        "&>>": 1, "~=": 1 };
+
+// The operators that get one space on each side when they are infix. Anything absent is
+// left as written — `<` and `>` and everything built from them because of generics, `!`
+// and `~` and `++` because they are not infix at all, `?.` and `::` and `...` because they
+// bind their two sides together rather than standing between them.
+var FORCED = {
+    "=": 1, "==": 1, "===": 1, "!=": 1, "!==": 1,
+    "+": 1, "-": 1, "*": 1, "/": 1, "%": 1, "**": 1,
+    "&": 1, "|": 1, "^": 1, "&&": 1, "||": 1, "??": 1,
+    "+=": 1, "-=": 1, "*=": 1, "/=": 1, "%=": 1, "**=": 1,
+    "&=": 1, "|=": 1, "^=": 1, "&&=": 1, "||=": 1, "??=": 1,
+    "->": 1, "=>": 1
+};
+
+// One table per language, built once at load, so the lexer never asks which language it is
+// in — it asks its own table.
+function operatorTables(id) {
+    var ops = {}, forced = {};
+    var name;
+    for (name in OPERATORS) {
+        if (Object.prototype.hasOwnProperty.call(OPERATORS, name)) { ops[name] = 1; }
+    }
+    for (name in FORCED) {
+        if (Object.prototype.hasOwnProperty.call(FORCED, name)) { forced[name] = 1; }
+    }
+    if (id === "swift") {
+        for (name in SWIFT_OPERATORS) {
+            if (!Object.prototype.hasOwnProperty.call(SWIFT_OPERATORS, name)) { continue; }
+            ops[name] = 1;
+            if (name !== "~=") { forced[name] = 1; }
+        }
+    }
+    return { ops: ops, forced: forced };
+}
+
+(function () {
+    for (var id in SYNTAX) {
+        if (Object.prototype.hasOwnProperty.call(SYNTAX, id)) {
+            SYNTAX[id].operators = operatorTables(id);
+        }
+    }
+    SYNTAX_PLAIN.operators = operatorTables("");
+}());
+
+// The characters that can continue an operator. `,` and `;` are absent on purpose: they
+// end a token rather than joining one, so `a,-b` can never be munched into `,-`.
+function isOpTail(code) {
+    return code === AMP || code === PLUS || code === MINUS || code === STAR || code === SLASH
+        || code === PERCENT || code === EQ || code === BANG || code === LT || code === GT
+        || code === AMP || code === PIPE || code === CARET || code === QUESTION
+        || code === COLON || code === DOT;
+}
+
+// Has a value just ended? The question behind three decisions — whether an operator is
+// infix, whether `/` opens a pattern, whether `?` opens a ternary — and `}` is the one
+// token that answers it differently depending on which is being asked.
+//
+// For `/`, a `}` answers **no**: it much more often closes a block than an object literal,
+// and `function f() {} /re/` is the case that matters. For everything else it answers
+// **yes**, because `folders.contains { $0.url == x } ? a : b` is ordinary Swift and
+// `refusal ? { error: refusal } : null` is ordinary JavaScript, and reading the `}` as the
+// end of a block there loses the ternary. Nothing is at risk in the other direction: an
+// operator that only *might* be infix is one this pass puts a space around, and a line
+// beginning with a prefix operator immediately after a closing brace is not a thing anyone
+// writes.
+function valueBefore(kind, code) {
+    if (kind === K_WORD || kind === K_ATTRIBUTE || kind === K_NUMBER || kind === K_STRING
+        || kind === K_REGEX) {
+        return true;
+    }
+    return kind === K_CLOSE && code !== CLOSE_BRACE;
+}
+
+function endsValue(kind, code) {
+    return valueBefore(kind, code) || (kind === K_CLOSE && code === CLOSE_BRACE);
+}
+
+// The whole of the spacing policy, in the order the questions have to be asked.
+function gapBetween(prevK, prevC, prevForced, curK, curC, curForced, hadSpace, ternary) {
+    if (prevK === K_NONE) { return ""; }
+    if (curK === K_COMMA || curK === K_SEMI) { return ""; }
+    if (curK === K_CLOSE && curC !== CLOSE_BRACE) { return ""; }
+    if (prevK === K_OPEN && prevC !== OPEN_BRACE) { return ""; }
+    // `{` and `}` collapse and no more, including here: whether a one-line block reads
+    // `{ f(); }` or `{f();}` is a house style, and both halves of it have to agree.
+    if (curK === K_CLOSE || prevK === K_OPEN) { return hadSpace ? " " : ""; }
+    if (prevK === K_COMMA || prevK === K_SEMI) { return " "; }
+    if (curK === K_COLON) { return ternary ? " " : ""; }
+    if (prevK === K_COLON) { return " "; }
+    // `obj . prop` closes up; `flag ? .red : .blue` must not, because `?.` is a different
+    // operator and writing it would change what the line means.
+    if (curK === K_DOT) { return valueBefore(prevK, prevC) ? "" : (hadSpace ? " " : ""); }
+    if (prevK === K_DOT) { return ""; }
+    // Only what follows a comment collapses. What comes *before* one is handled by the
+    // caller, which copies it through: a trailing comment is very often aligned into a
+    // column with the ones above and below it, and a formatter that pulled every one of
+    // them back to a single space would be rewriting something a person did on purpose.
+    if (prevK === K_COMMENT || curK === K_COMMENT) { return hadSpace ? " " : ""; }
+    // An attribute is the one word whose bracket cannot be settled from here. Swift writes
+    // `@available(*, deprecated)` closed up, because those are the attribute's arguments,
+    // and `@escaping (T) -> U` open, because that is the type it is attached to. Nothing
+    // short of knowing the attribute tells them apart, so both are left as written.
+    if (prevK === K_ATTRIBUTE && curK === K_OPEN) { return hadSpace ? " " : ""; }
+    if (curK === K_OPEN && curC !== OPEN_BRACE) {
+        // `if (x)` keeps its space and `f (x)` loses it: a keyword takes an expression,
+        // a name takes an argument list. `private(set)` is why access modifiers are not
+        // keywords here.
+        if (prevK === K_KEYWORD) { return " "; }
+        if (prevK === K_CLOSE || valueBefore(prevK, prevC)) { return ""; }
+    }
+    if (curK === K_OPEN && curC === OPEN_BRACE) {
+        if (prevK === K_KEYWORD || prevK === K_WORD || prevK === K_CLOSE
+            || prevK === K_NUMBER || prevK === K_STRING) { return " "; }
+    }
+    if (curForced || prevForced) { return " "; }
+    return hadSpace ? " " : "";
+}
+
+// A line's leading whitespace, copied through untouched — Reindent owns it, and running
+// this on its own should not quietly re-indent anything.
+function copyLead(text, i, len, out) {
+    var from = i;
+    while (i < len) {
+        var code = text.charCodeAt(i);
+        if (code !== SPACE && code !== TAB) { break; }
+        i++;
+    }
+    if (i > from) { out.add(text.slice(from, i)); }
+    return i;
+}
+
+function endOfCodeBlockComment(text, i, len) {
+    var from = i;
+    i += 2;
+    while (i < len) {
+        if (text.charCodeAt(i) === STAR && text.charCodeAt(i + 1) === SLASH) { return i + 2; }
+        i++;
+    }
+    refuse("A block comment opened here is never closed.", from);
+}
+
+function endOfTriple(text, i, len, mark, want) {
+    var from = i;
+    i += 3;
+    while (i < len) {
+        var code = text.charCodeAt(i);
+        if (code === BACKSLASH && want === 0) { i += 2; continue; }
+        if (code === mark && text.charCodeAt(i + 1) === mark
+            && text.charCodeAt(i + 2) === mark && closingHashes(text, i + 3, want)) {
+            return i + 3 + want;
+        }
+        i++;
+    }
+    refuse("A multi-line string opened here is never closed.", from);
+}
+
+// A template literal, and the code inside each `${…}` of it. The interpolation has to be
+// walked rather than skipped, because a backtick inside one belongs to a *different*
+// template and stopping at it would end this string in the middle of an expression.
+function endOfTemplate(text, i, len, syn) {
+    var from = i;
+    i++;
+    while (i < len) {
+        var code = text.charCodeAt(i);
+        if (code === BACKSLASH) { i += 2; continue; }
+        if (code === BACKTICK) { return i + 1; }
+        if (code === DOLLAR && text.charCodeAt(i + 1) === OPEN_BRACE) {
+            i += 2;
+            var nest = 1;
+            while (i < len && nest > 0) {
+                var inner = text.charCodeAt(i);
+                if (inner === OPEN_BRACE) { nest++; i++; }
+                else if (inner === CLOSE_BRACE) { nest--; i++; }
+                else if (inner === QUOTE || inner === APOS || inner === BACKTICK) {
+                    i = endOfCodeString(text, i, len, syn);
+                } else if (inner === SLASH && text.charCodeAt(i + 1) === SLASH) {
+                    while (i < len && text.charCodeAt(i) !== LF) { i++; }
+                } else if (inner === SLASH && text.charCodeAt(i + 1) === STAR) {
+                    i = endOfCodeBlockComment(text, i, len);
+                } else { i++; }
+            }
+            continue;
+        }
+        i++;
+    }
+    refuse("A template literal opened here is never closed.", from);
+}
+
+function endOfCodeString(text, i, len, syn) {
+    var code = text.charCodeAt(i);
+    if (code === HASH) {
+        var opened = openingHashes(text, i);
+        i += opened;
+        if (text.charCodeAt(i + 1) === QUOTE && text.charCodeAt(i + 2) === QUOTE) {
+            return endOfTriple(text, i, len, QUOTE, opened);
+        }
+        return endOfSimpleString(text, i, len, QUOTE, opened, true);
+    }
+    if (code === BACKTICK) { return endOfTemplate(text, i, len, syn); }
+    if (syn.triple === 1 && text.charCodeAt(i + 1) === code
+        && text.charCodeAt(i + 2) === code) {
+        return endOfTriple(text, i, len, code, 0);
+    }
+    return endOfSimpleString(text, i, len, code, 0, true);
+}
+
+function respace(text, languageID) {
+    var syn = syntaxFor(languageID);
+    var len = text.length;
+    var out = new Out();
+
+    // What came before, kept *across* the line break rather than reset at it. A line that
+    // begins `? a : b` or `+ total` is the rest of the line above it, and every question
+    // this pass asks — is this operator infix, does this `/` open a pattern, does this `?`
+    // open a ternary — is about the token before it and not about the column it is in.
+    // What the line break does end is the *gap*: `startOfLine` says the leading whitespace
+    // has already been copied and belongs to Reindent.
+    var prevK = K_NONE, prevC = 0, prevForced = false;
+    var startOfLine = false;
+    var pend = [];              // ternary `?` waiting for its `:`, counted per depth
+    var depth = 0;
+    var attrDepth = -1;         // the depth of an attribute's own argument list
+    var openCode = [], openAt = [];
+    var i = copyLead(text, 0, len, out);
+
+    while (i < len) {
+        // The whitespace before the next token, which this pass exists to replace. A line
+        // ending is not whitespace of that kind: it is copied, exactly as it was written,
+        // and the line after it starts over with nothing to its left.
+        var hadSpace = false;
+        var gapFrom = i;
+        for (;;) {
+            var g = text.charCodeAt(i);
+            if (g === SPACE || g === TAB) { hadSpace = true; i++; continue; }
+            if (g === LF || g === CR) {
+                if (g === CR && text.charCodeAt(i + 1) === LF) { out.add("\r\n"); i += 2; }
+                else { out.add(g === CR ? "\r" : "\n"); i++; }
+                i = copyLead(text, i, len, out);
+                startOfLine = true;
+                hadSpace = false;
+                gapFrom = i;
+                continue;
+            }
+            break;
+        }
+        if (i >= len) { break; }
+
+        var from = i;
+        var code = text.charCodeAt(i);
+        var kind = K_OP;
+        var forced = false;
+        var ternary = false;
+        var opensLine = startOfLine;
+
+        if (isWordStart(code)) {
+            i++;
+            while (i < len && isWordPart(text.charCodeAt(i))) { i++; }
+            // A word after `.` is a member name whatever it is spelt like, so `.catch(fn)`
+            // and `.default` are calls and properties rather than keywords with a space
+            // owing to them.
+            kind = prevK !== K_DOT && isKeywordAt(text, from, i, syn.keywords) ? K_KEYWORD
+                : (prevK === K_OP && prevC === AT ? K_ATTRIBUTE : K_WORD);
+
+        } else if (isDigit(code) || (code === DOT && isDigit(text.charCodeAt(i + 1)))) {
+            i = endOfCodeNumber(text, i, len);
+            kind = K_NUMBER;
+
+        } else if (code === SLASH && syn.slash === 1 && text.charCodeAt(i + 1) === SLASH) {
+            while (i < len && text.charCodeAt(i) !== LF && text.charCodeAt(i) !== CR) { i++; }
+            kind = K_COMMENT;
+
+        } else if (code === SLASH && syn.block === 1 && text.charCodeAt(i + 1) === STAR) {
+            i = endOfCodeBlockComment(text, i, len);
+            kind = K_COMMENT;
+
+        } else if (code === HASH && from === 0 && text.charCodeAt(1) === BANG) {
+            while (i < len && text.charCodeAt(i) !== LF && text.charCodeAt(i) !== CR) { i++; }
+            kind = K_COMMENT;
+
+        } else if (syn.rawHash === 1 && code === HASH && openingHashes(text, i) > 0) {
+            i = endOfCodeString(text, i, len, syn);
+            kind = K_STRING;
+
+        } else if (code === QUOTE || (code === APOS && syn.apos === 1)
+                   || (code === BACKTICK && syn.raw === 1)) {
+            i = endOfCodeString(text, i, len, syn);
+            kind = K_STRING;
+
+        } else if (code === BACKTICK && syn.tick === 1) {
+            // Swift's escaped identifier, `` `default` ``. A name, not a string.
+            i++;
+            while (i < len && text.charCodeAt(i) !== BACKTICK
+                   && text.charCodeAt(i) !== LF) { i++; }
+            if (i < len && text.charCodeAt(i) === BACKTICK) { i++; }
+            kind = K_WORD;
+
+        } else if (code === SLASH && syn.regex === 1 && !valueBefore(prevK, prevC)
+                   && endOfRegex(text, i, len) > 0) {
+            i = endOfRegex(text, i, len);
+            kind = K_REGEX;
+
+        } else if (code === OPEN_PAREN || code === OPEN_BRACKET || code === OPEN_BRACE) {
+            openCode[openCode.length] = code;
+            openAt[openAt.length] = i;
+            // `@convention(block) (JSValue?) -> Void`: the bracket after an attribute's own
+            // arguments is as unsettleable as the one after the attribute itself, so the
+            // attribute is carried as far as its closing `)`.
+            if (prevK === K_ATTRIBUTE && code === OPEN_PAREN && attrDepth < 0) {
+                attrDepth = depth;
+            }
+            depth++;
+            pend[depth] = 0;
+            i++;
+            kind = K_OPEN;
+
+        } else if (code === CLOSE_PAREN || code === CLOSE_BRACKET || code === CLOSE_BRACE) {
+            var want = code === CLOSE_PAREN ? OPEN_PAREN
+                : code === CLOSE_BRACKET ? OPEN_BRACKET : OPEN_BRACE;
+            if (openCode.length === 0) {
+                refuse("This closes a bracket that was never opened.", i);
+            }
+            if (openCode[openCode.length - 1] !== want) {
+                refuse("This closes the wrong kind of bracket.", i);
+            }
+            openCode.length = openCode.length - 1;
+            openAt.length = openAt.length - 1;
+            pend[depth] = 0;
+            depth--;
+            i++;
+            kind = K_CLOSE;
+            if (attrDepth === depth) { kind = K_ATTRIBUTE; attrDepth = -1; }
+
+        } else {
+            // An operator, taken as long as one these languages actually spell.
+            var span = 1;
+            if (isOpTail(text.charCodeAt(i + 1))) {
+                var most = len - i;
+                if (most > 4) { most = 4; }
+                for (var n = most; n > 1; n--) {
+                    if (syn.operators.ops[text.slice(i, i + n)] === 1) { span = n; break; }
+                }
+            }
+            i += span;
+
+            if (span === 1 && code === COMMA) { kind = K_COMMA; }
+            else if (span === 1 && code === SEMI) { kind = K_SEMI; pend[depth] = 0; }
+            else if (span === 1 && code === DOT) { kind = K_DOT; }
+            else if (span === 1 && code === COLON) {
+                kind = K_COLON;
+                if (pend[depth] > 0) { pend[depth]--; ternary = true; }
+            } else {
+                kind = K_OP;
+                var infix = endsValue(prevK, prevC);
+                if (span === 1 && code === QUESTION && infix
+                    && startsOperand(text, i, len, syn.keywords)) {
+                    pend[depth] = (pend[depth] === undefined ? 0 : pend[depth]) + 1;
+                    forced = true;
+                } else if (infix) {
+                    var op = text.slice(from, i);
+                    // `URL?? = nil` is a double optional, not a nil-coalescing with nothing
+                    // to coalesce. The same question as the ternary's, asked of `??`.
+                    forced = syn.operators.forced[op] === 1
+                        && (op !== "??" || startsOperand(text, i, len, syn.keywords));
+                }
+            }
+        }
+
+        // **More than one space is alignment, and alignment is left alone.** What this
+        // pass decides is the choice between one space and none; a column somebody lined
+        // up — a table of settings, a run of trailing comments, two `->` under each other —
+        // was done on purpose, and collapsing it is the change a formatter is least
+        // forgiven for. A single tab counts as alignment for the same reason.
+        var gap;
+        var wide = from - gapFrom;
+        if (startOfLine || prevK === K_NONE) {
+            gap = "";
+        } else if (wide > 1 || (wide === 1 && text.charCodeAt(gapFrom) === TAB)) {
+            gap = text.slice(gapFrom, from);
+        } else {
+            gap = gapBetween(prevK, prevC, prevForced, kind, code, forced, hadSpace, ternary);
+        }
+        if (gap !== "") { out.add(gap); }
+        startOfLine = false;
+        // A statement starting is where an unanswered `?` is given up on. Swift's
+        // `var x: Int? { get }` looks exactly like a ternary opening onto a closure, and
+        // only one of them ever produces the `:` that would settle it; without a boundary
+        // the other would go on waiting and take the next annotation's colon instead. A
+        // `;` is that boundary where there is one, and a line beginning with a keyword is
+        // that boundary in the languages that do not use `;`.
+        if (opensLine && kind === K_KEYWORD) { pend.length = 0; }
+        out.add(text.slice(from, i));
+
+        prevK = kind;
+        prevC = code;
+        prevForced = forced;
+    }
+
+    if (openCode.length > 0) {
+        refuse("A bracket opened here is never closed.", openAt[openAt.length - 1]);
+    }
+    return out.done();
+}
+
+// Does an operand start here? Which is to say: is this `?` the start of a ternary, rather
+// than an optional type or the tail of `try?`
+// and `as?`? Those last two are already excluded by the caller, which asks only when a
+// value has just ended, and `try` and `as` are keywords. Optional chaining never reaches
+// here either: `x?.y` is spelt with the two characters adjacent, so it was read as the one
+// operator `?.` — which is why a `.` *after a space* is a perfectly good ternary, and Swift
+// writes `flag ? .red : .blue` all the time. What is left is settled by what comes next: a
+// ternary always has something to return, and neither does `??` coalesce with nothing —
+// `URL?? = nil` is a double optional, and the two are the same question.
+//
+// Adjacency decides the other two the same way it decides `?.`: `fullHeightDidChange?(x)`
+// and `values?[0]` are an optional call and an optional subscript, written with nothing
+// between the `?` and the bracket, while `flag ? (a) : (b)` is a ternary that happens to
+// have parenthesised its halves. Reading the first as the second turns `init?(header:)`
+// into `init ? (header:)`, which is not Swift at all.
+function startsOperand(text, i, len, keywords) {
+    var skipped = false;
+    while (i < len) {
+        var code = text.charCodeAt(i);
+        if (code === SPACE || code === TAB) { skipped = true; i++; continue; }
+        if (!skipped && (code === OPEN_PAREN || code === OPEN_BRACKET)) { return false; }
+        // A ternary's first half is an expression, and an expression does not start with
+        // `in`. Swift's `compactMap { x -> Thing? in` does, and reading its `?` as a
+        // ternary puts a space between a type and its question mark.
+        if (isWordStart(code)) {
+            var to = i + 1;
+            while (to < len && isWordPart(text.charCodeAt(to))) { to++; }
+            if (isKeywordAt(text, i, to, keywords)) { return false; }
+        }
+        // `{` is counted out, and that is a choice rather than a fact. `cond ? { … } : x`
+        // is a ternary onto a closure and `-> Thing? {` is an optional return type meeting
+        // its body, and one token of lookahead cannot tell them apart. The second is far
+        // the commoner in Swift — eight of them in sixty files of the editor's own source,
+        // against two of the first — and `-> Any ? {` reads as broken where a ternary
+        // missing one space before its colon only reads as untidy.
+        return !(code === COMMA || code === COLON || code === QUESTION
+                 || code === EQ || code === GT || code === SEMI
+                 || code === CLOSE_PAREN || code === CLOSE_BRACKET || code === CLOSE_BRACE
+                 || code === OPEN_BRACE || code === LF || code === CR);
+    }
+    return false;
+}
+
+// The languages Format Document reformats as code: what the panel calls each of them, and
+// the files each one claims. `.jsx` and `.tsx` are deliberately absent from the second list
+// — see `formatterFor`.
+var CODE_LANGUAGES = {
+    "swift":         { name: "Swift",      extensions: ["swift"] },
+    "java":          { name: "Java",       extensions: ["java"] },
+    "javascript.js": { name: "JavaScript", extensions: ["js", "mjs", "cjs"] },
+    "typescript":    { name: "TypeScript", extensions: ["ts", "mts", "cts"] }
+};
+
+// JSX is a different grammar living in the same files, and nothing here reads it: `<div>`
+// is not an operator and `</div>` is not a division. Reindent and Tidy are unaffected —
+// neither of them looks at a `<` — so what these files lose is Format Document alone.
+var JSX_EXTENSIONS = { jsx: 1, tsx: 1 };
+
+function formatCode(text, languageID, opt) {
+    return reindent(respace(text, languageID), languageID, opt);
+}
+
+// ---------------------------------------------------------------------------------------
 // §6  Which formatter a document gets
 // ---------------------------------------------------------------------------------------
 //
@@ -1650,7 +2766,8 @@ function extensionOf(path) {
     return dot <= 0 ? "" : name.slice(dot + 1).toLowerCase();
 }
 
-// One of "json", "xml", "html", "css", or "" when nothing here formats this document.
+// One of "json", "xml", "html", "css", "code", or "" when nothing here formats this
+// document.
 function formatterFor(languageID, path) {
     if (languageID === "json") { return "json"; }
     if (languageID === "xml") { return "xml"; }
@@ -1659,6 +2776,16 @@ function formatterFor(languageID, path) {
         // `css` covers SCSS and LESS in the editor's language database, and one formatter
         // covers all three, so the extension is not consulted here.
         return "css";
+    }
+    if (CODE_LANGUAGES[languageID] !== undefined) {
+        var extension = extensionOf(path);
+        // The one place the extension outranks the language id. A `.vue` file is lexed as
+        // JavaScript by the editor and is markup by construction, so the table below has
+        // the better answer for it — and a `.jsx` or `.tsx` holds a grammar §5b does not
+        // read.
+        var claimed = BY_EXTENSION[extension];
+        if (claimed !== undefined) { return claimed; }
+        return JSX_EXTENSIONS[extension] === 1 ? "" : "code";
     }
     var byExtension = BY_EXTENSION[extensionOf(path)];
     return byExtension === undefined ? "" : byExtension;
@@ -1682,23 +2809,36 @@ function extensionsFor(kind, limit) {
 }
 
 // What still works on a document nothing here formats — and only what still works. Reindent
-// needs brackets, so for Python, Markdown, YAML and shell it is Tidy alone. Saying "Reindent
-// and Tidy" everywhere was the first version of this, and it was wrong in exactly the cases
-// a user is most likely to be looking at when they read it.
+// needs a structure to read the indentation back out of, which for Markdown, YAML and shell
+// there is not, so for those it is Tidy alone. Saying "Reindent and Tidy" everywhere was the
+// first version of this, and it was wrong in exactly the cases a user is most likely to be
+// looking at when they read it.
 function alsoAvailable(languageID) {
     return REINDENTABLE[languageID] === 1
         ? "Reindent and Tidy Whitespace are on the Plugins menu."
         : "Tidy Whitespace is on the Plugins menu.";
 }
 
-function runFormatter(kind, text, opt, minify) {
+function runFormatter(kind, text, opt, minify, languageID) {
     switch (kind) {
     case "json": return formatJSON(text, opt, minify);
     case "xml":  return formatMarkup(text, opt, false, minify);
     case "html": return formatMarkup(text, opt, true, minify);
     case "css":  return formatCSS(text, opt);
+    case "code": return formatCode(text, languageID, opt);
     }
     return null;
+}
+
+// The extensions a code language claims, for the one sentence that has to name them.
+function codeExtensions() {
+    var list = [];
+    for (var id in CODE_LANGUAGES) {
+        if (!Object.prototype.hasOwnProperty.call(CODE_LANGUAGES, id)) { continue; }
+        var claimed = CODE_LANGUAGES[id].extensions;
+        for (var n = 0; n < claimed.length; n++) { list[list.length] = "." + claimed[n]; }
+    }
+    return list;
 }
 
 // ---------------------------------------------------------------------------------------
@@ -1781,6 +2921,12 @@ function formatDocument(minify) {
                    + alsoAvailable(linelark.language())
                    + " See the plugin's README for why there is no more than that.", true);
     }
+    if (minify && kind === "code") {
+        return say("Minify: not offered for " + CODE_LANGUAGES[linelark.language()].name
+                   + ". Taking the line breaks out of a program is a different job from "
+                   + "formatting it, and nothing here does it. JSON and XML minify exactly.",
+                   true);
+    }
     if (minify && (kind === "css" || kind === "html")) {
         return say("Minify: not offered for " + (kind === "css" ? "CSS" : "HTML")
                    + ", because whitespace there is not always removable without changing "
@@ -1791,8 +2937,9 @@ function formatDocument(minify) {
     var bom = bomOf(text);
     var body = bom.length > 0 ? text.slice(1) : text;
     var opt = optionsFor(body);
-    var result = guard(function () { return runFormatter(kind, body, opt, minify); },
-                       body, what);
+    var result = guard(function () {
+        return runFormatter(kind, body, opt, minify, linelark.language());
+    }, body, what);
     if (result === null) { return; }
     // A document that ended in a newline keeps ending in one. Formatting is not the moment
     // to take a decision about something nobody asked about.
@@ -1848,7 +2995,8 @@ linelark.addContextMenuItem({
     kinds: ["file"],
     extensions: ["json", "jsonc", "ipynb", "webmanifest", "xml", "svg", "plist", "xsd",
                  "xsl", "xslt", "rss", "atom", "csproj", "storyboard", "xib", "html",
-                 "htm", "xhtml", "vue", "css", "scss", "less"],
+                 "htm", "xhtml", "vue", "css", "scss", "less",
+                 "swift", "java", "js", "mjs", "cjs", "ts", "mts", "cts"],
     handler: function () { formatDocument(false); }
 });
 
@@ -1904,7 +3052,9 @@ function unsupportedNodes() {
             { id: "kind.html", title: "HTML", symbol: "globe",
               detail: extensionsFor("html", 0) },
             { id: "kind.css", title: "CSS", symbol: "paintbrush",
-              detail: extensionsFor("css", 0) }
+              detail: extensionsFor("css", 0) },
+            { id: "kind.code", title: "Swift, Java, JavaScript, TypeScript",
+              symbol: "curlybraces.square", detail: codeExtensions().join("  ") }
         ]},
         statusNode()
     ];
@@ -1922,6 +3072,11 @@ function panelNodes() {
     if (kind === "json") { what = "Formats as JSON."; }
     else if (kind === "xml") { what = "Formats as XML."; }
     else if (kind === "html") { what = "Formats as HTML."; }
+    else if (kind === "code") {
+        // Named rather than called "code", because the one thing a reader wants confirmed
+        // here is that the plugin agrees with them about what this file is.
+        what = "Formats as " + CODE_LANGUAGES[language].name + " — indentation and spacing.";
+    }
     else { what = "Formats as CSS."; }
 
     var canMinify = kind === "json" || kind === "xml";

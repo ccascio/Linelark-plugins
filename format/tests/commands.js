@@ -53,13 +53,45 @@ open('{"a":1}', "normal", "/tmp/config.json");
 run("format.document");
 check("extension fallback", __doc.text, '{\n    "a": 1\n}');
 
+open('# x\n', "markdown", "/tmp/x.md");
+run("format.document");
+check("markdown refusal names only what really applies",
+      lastLog().indexOf("Tidy Whitespace is on the Plugins menu.") > 0, true);
+check("and does not promise Reindent, which Markdown cannot have",
+      lastLog().indexOf("Reindent") < 0, true);
+check("markdown untouched", __doc.text, '# x\n');
+
+// Python has no Format, but it does have a Reindent now, and the sentence has to say so.
 open('def f():\n    pass\n', "python", "/tmp/x.py");
 run("format.document");
-check("python refusal names only what really applies",
-      lastLog().indexOf("Tidy Whitespace is on the Plugins menu.") > 0, true);
-check("and does not promise Reindent, which Python cannot have",
-      lastLog().indexOf("Reindent") < 0, true);
-check("python untouched", __doc.text, 'def f():\n    pass\n');
+check("python refusal offers Reindent",
+      lastLog().indexOf("Reindent and Tidy Whitespace are on the Plugins menu.") > 0, true);
+check("python untouched by Format", __doc.text, 'def f():\n    pass\n');
+run("format.reindent");
+check("python reindented", __doc.text, 'def f():\n    pass\n');
+
+// The four code languages format, and a .jsx does not — it is JavaScript to the editor and
+// a grammar this plugin does not read.
+open('func f(){\nlet a=[1,2]\n}\n', "swift", "/tmp/x.swift");
+run("format.document");
+check("swift formatted", __doc.text, 'func f() {\n    let a = [1, 2]\n}\n');
+run("format.minify");
+check("swift minify refused", lastLog().indexOf("not offered for Swift") > 0, true);
+
+open('const a=1\n', "javascript.js", "/tmp/app.jsx");
+run("format.document");
+check("jsx refused", lastLog().indexOf("No formatter") < 0
+      && lastLog().indexOf("nothing here formats") > 0, true);
+check("jsx untouched", __doc.text, 'const a=1\n');
+
+open('const a=1;\n', "typescript", "/tmp/x.ts");
+run("format.document");
+check("ts formatted", __doc.text, 'const a = 1;\n');
+
+// A .vue is lexed as JavaScript by the editor and is markup by construction.
+open('<div><p>hi</p></div>\n', "javascript.js", "/tmp/x.vue");
+run("format.document");
+check("vue formatted as HTML", __doc.text, '<div>\n    <p>hi</p>\n</div>\n');
 
 open('a{color:red}', "css", "/tmp/x.css");
 run("format.minify");
@@ -135,24 +167,37 @@ check("BOM did not become content", __doc.text.charCodeAt(0), 0xFEFF);
 
 function typesOf(nodes) { return nodes.map(function (n) { return n.type; }).join(","); }
 
-open('def f():\n    pass\n', "python", "/tmp/x.py");
+open('# x\n', "markdown", "/tmp/x.md");
 var dead = __panels[0].render();
 check("unsupported panel says so first", dead[0].text, "No formatter for this file.");
 check("unsupported panel offers no controls", typesOf(dead), "text,text,rows,text");
-check("unsupported panel names only Tidy for Python", dead[1].text,
+check("unsupported panel names only Tidy for Markdown", dead[1].text,
       "Tidy Whitespace is on the Plugins menu.");
-check("unsupported panel lists the four formatters",
-      dead[2].rows.map(function (r) { return r.title; }).join(","), "JSON,XML,HTML,CSS");
+check("unsupported panel lists every formatter",
+      dead[2].rows.map(function (r) { return r.title; }).join(","),
+      "JSON,XML,HTML,CSS,Swift, Java, JavaScript, TypeScript");
+check("the code row is derived from the same table the dispatch uses",
+      dead[2].rows[4].detail, ".swift  .java  .js  .mjs  .cjs  .ts  .mts  .cts");
 check("the list is derived, so JSON's extensions are the dispatch table's",
       dead[2].rows[0].detail, ".json  .jsonc  .ipynb  .webmanifest");
 check("a long list is capped rather than truncated silently",
       dead[2].rows[1].detail.indexOf("more") > 0, true);
 check("status line is still last", dead[dead.length - 1].type, "text");
 
-// A language that Reindent *does* handle gets told so.
-open('func f() {\n}\n', "swift", "/tmp/x.swift");
-check("swift is told about Reindent too", __panels[0].render()[1].text,
+// A language that Reindent *does* handle gets told so, even with no Format behind it.
+open('def f():\n    pass\n', "python", "/tmp/x.py");
+check("python is told about Reindent too", __panels[0].render()[1].text,
       "Reindent and Tidy Whitespace are on the Plugins menu.");
+
+// A code language gets the full panel, and it says which language it thinks this is.
+open('func f() {\n}\n', "swift", "/tmp/x.swift");
+var code = __panels[0].render();
+check("code panel keeps its controls", typesOf(code),
+      "text,button,actions,section,section,text");
+check("code panel names the language", code[0].text,
+      "Formats as Swift — indentation and spacing.");
+check("code panel offers Reindent", code[2].actions[1].enabled, true);
+check("code panel refuses Minify", code[2].actions[0].enabled, false);
 
 // The supported state is unchanged, and still shape-stable.
 open('{"a":1}', "json", "/tmp/x.json");

@@ -17,7 +17,7 @@ if [ "$1" = "bench" ]; then
     # The editor's JSContext does not JIT, so a benchmark that lets jsc JIT is measuring an
     # engine the plugin will never run in. `document-preview` measured ~2 ms/KB for marked
     # under the same conditions; that is the number to beat.
-    for b in bench-json bench-markup bench-rest; do
+    for b in bench-json bench-markup bench-rest bench-code; do
         echo "--- $b ---"
         "$JSC" --useJIT=false "$HERE/tests/harness.js" "$MAIN" "$HERE/tests/$b.js"
     done
@@ -25,7 +25,7 @@ if [ "$1" = "bench" ]; then
 fi
 
 status=0
-for t in json markup css reindent-tidy fuzz-markup; do
+for t in json markup css reindent-tidy code python fuzz-markup fuzz-code; do
     printf '%-14s ' "$t"
     "$JSC" "$HERE/tests/harness.js" "$MAIN" "$HERE/tests/$t.js" | grep -Ev '^round trip' || status=1
 done

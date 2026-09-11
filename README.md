@@ -20,8 +20,10 @@ release of the editor.
 
 | Plugin | Shows |
 | --- | --- |
+| [`web-import`](web-import/) | Import rendered webpages or local HTML with selection, section filters, Markdown/HTML output, and source attribution (Studio, API 11) |
 | [`sort-lines`](sort-lines/) | Editing: expand a selection to whole lines, compute the result, apply it as one undoable edit — and a panel that is a form, built out of rows because there is no checkbox node, and gated on nothing the panel cannot watch change |
 | [`document-preview`](document-preview/) | Rendering: Markdown and HTML drawn in place of their source, two previews from one plugin, each block carrying the offset it came from so the switch keeps your place |
+| [`format`](format/) | Scanning: formatters for JSON, XML, HTML, CSS and four code languages, each built around one rule about what must be copied through untouched — and the only plugin here that brings its own test runner, because there is no other way to know |
 | [`github`](github/) | A git client: stage, commit, pull, push, diffs of what has changed, branches, and pull requests from the API. The one that asks for permissions, and the one to read for what a real panel looks like |
 | [`scratch-notes`](scratch-notes/) | Keeping something: notes pinned to a line, saved as you type, and a panel that redraws when the caret moves — the one case `followsCaret` exists for |
 | [`compare-files`](compare-files/) | Comparing and merging: a patience diff computed in JavaScript, drawn by `openDiff` with merge arrows down the middle, and a write back into either file |

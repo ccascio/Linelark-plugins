@@ -9,6 +9,19 @@ check("nested", ri('if (a) {\nif (b) {\nx();\n}\n}'),
       'if (a) {\n    if (b) {\n        x();\n    }\n}');
 check("closing bracket dedents", ri('var a = [\n1,\n2\n];'), 'var a = [\n    1,\n    2\n];');
 check("continuation inside parens", ri('f(\na,\nb\n);'), 'f(\n    a,\n    b\n);');
+// Brackets opened on one line are one level, not one each. `defineConfig({` is the shape
+// of nearly every JavaScript config file there is, and counting both would bring a
+// two-space file back at eight.
+check("two brackets on a line are one level",
+      ri('export default defineConfig({\nfoo: 1,\n})'),
+      'export default defineConfig({\n    foo: 1,\n})');
+check("a callback argument is one level",
+      ri("test('x', () => {\nassert(1);\n});"), "test('x', () => {\n    assert(1);\n});");
+check("brackets on separate lines are a level each",
+      ri('const a = {\nb: [\n1\n]\n};'), 'const a = {\n    b: [\n        1\n    ]\n};');
+check("a closing line takes the level of the line its bracket opened on",
+      ri('const a = {b: [\n1\n]};'), 'const a = {b: [\n    1\n]};');
+
 check("over-indented is fixed", ri('function f() {\n            var a = 1;\n      }'),
       'function f() {\n    var a = 1;\n}');
 check("blank lines emptied", ri('a() {\n   \nb();\n}'), 'a() {\n\n    b();\n}');
@@ -37,8 +50,6 @@ check("crlf preserved", ri('function f() {\r\nvar a = 1;\r\n}'),
       'function f() {\r\n    var a = 1;\r\n}');
 check("no trailing newline added", ri('if (a) {\nb();\n}'), 'if (a) {\n    b();\n}');
 
-checkRefusal("python refused", function () { ri('def f():\n  pass\n', "python"); },
-             "block structure");
 checkRefusal("markdown refused", function () { ri('# x\n', "markdown"); }, "brackets");
 
 // --- Tidy ---
@@ -81,11 +92,17 @@ settings.collapseBlanks = true;
 // "Known limits" section is checked rather than remembered, and so that anything which fixes
 // one of them fails loudly instead of quietly making a claim in the README untrue.
 
-// A regex literal is not recognised, so a brace inside one counts as structure. Telling a
-// regex from a division needs the previous significant token — a lexer this plugin does not
-// otherwise need.
-check("LIMIT: brace in a regex miscounts", ri('function f() {\nvar r = /[}]/;\nvar t = 1;\n}'),
-      'function f() {\n    var r = /[}]/;\nvar t = 1;\n}');
+// A regex literal is told from a division by what came before it, which is the same
+// question that decides whether an operator is infix. A brace inside a pattern is text.
+check("brace in a regex is not structure", ri('function f() {\nvar r = /[}]/;\nvar t = 1;\n}'),
+      'function f() {\n    var r = /[}]/;\n    var t = 1;\n}');
+check("a slash after a value still divides", ri('function f() {\nvar q = a / b;\nvar t = 1;\n}'),
+      'function f() {\n    var q = a / b;\n    var t = 1;\n}');
+check("a pattern that does not close on its line is a division",
+      ri('function f() {\nvar q = a / b, r = c / d;\nvar t = 1;\n}'),
+      'function f() {\n    var q = a / b, r = c / d;\n    var t = 1;\n}');
+check("regex after return", ri('function f() {\nif (x) {\nreturn /}/.test(s);\n}\n}'),
+      'function f() {\n    if (x) {\n        return /}/.test(s);\n    }\n}');
 
 // Template literals, by contrast, are handled — including the two cases that look as though
 // they would break it.
