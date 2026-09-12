@@ -1,6 +1,7 @@
 # Web Import
 
-Requires Linelark Studio with plugin API 11 (the host changes accompanying this plugin).
+Requires Linelark Studio 1.14.0 or later, which is where the host API reached generation 11
+and `importWebPage()` first existed.
 Install `Web Import.linelarkplugin`, then choose **Plugins → Import Web Content…** or
 use the Web Import panel.
 

@@ -3,7 +3,7 @@
   "name": "Web Import",
   "version": "1.0.0",
   "apiVersion": 11,
-  "minimumAppVersion": "1.11.0",
+  "minimumAppVersion": "1.14.0",
   "main": "main.js",
   "author": "Linelark",
   "description": "Import rendered webpages or local HTML as Markdown or HTML, with article extraction, selection, section filters, and a preview.",
