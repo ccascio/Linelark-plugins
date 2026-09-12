@@ -120,6 +120,10 @@ Generation 5 covers `addContextMenuItem`. Generation 6 covers remote management
 `workspaceFolders()` and `repoSelectFolder(path)` — which project in a multi-root workspace
 the git calls are about. Generation 9 covers the `figure` preview node — a diagram the plugin
 lays out itself — and `measureText`, which is what makes laying one out possible.
+Generation 10 covers `runInTerminal` and `canRunInTerminal` — command lines typed at a
+visible shell — plus `chooseFolder`. Generation 11 covers `importWebPage`. Generation 12
+covers `runQuery` and `canRunQuery`: one command run out of sight, with its exit status,
+stdout and stderr handed back.
 
 **`minimumAppVersion` is what the catalog says out loud.** `apiVersion` is the gate: the host
 compares it against its own generation and refuses what it cannot load. But a number is not
@@ -178,7 +182,9 @@ Opening       openFile(path) · openVirtual({key, name, text, label, language})
               openDiff({key, name, patch, label}) · folderRoot() · workspaceFolders()
 Scheduling    setTimeout · setInterval · clearTimeout · clearInterval · queueMicrotask
 Keeping       storeGet(key) · storeSet(key, value) · storeRemove(key) · storeKeys()
-Handing out   copyToClipboard(text) · exportFile({name, text})
+Handing out   copyToClipboard(text) · exportFile({name, text}) · chooseFolder({message})
+Commands      runInTerminal({name, folder, commands}) · canRunInTerminal()
+ (Studio)     runQuery({command, arguments, folder, timeout}) · canRunQuery()
 Network       fetch({url, method, headers, body, timeout}) · canReachNetwork() · hasSecret(name)
 Signing in    setSecret(name, value) · clearSecret(name)
 Which project repoSelectFolder(path) · repoSelectedFolder()
@@ -368,6 +374,34 @@ the one after it.
   quietly.** The save panel *is* the consent, so there is no path argument: a plugin offers
   a name and the text, and where it goes belongs to the user. `false` is usually just a
   cancelled panel, which is not an error.
+- **Two ways to run something, and they are not degrees of one thing.**
+  `runInTerminal({name, folder, commands})` types lines at a shell in the terminal panel and
+  returns *nothing* — the pane is the output, ⌃C is the stop button, and a password prompt
+  can be answered. `runQuery({command, arguments, folder, timeout})` runs one command with no
+  shell and no terminal and resolves with `{status, stdout, stderr, timedOut, truncated}`.
+  Discovery is the second — a panel cannot offer what a project contains without reading what
+  a tool printed — and anything whose output a person wants to watch is the first. Each needs
+  its own manifest key (`"terminal": "run"`, `"commands": "query"`) and its own switch, and
+  granting one grants nothing of the other.
+- **Both take a click, and an `await` ends the click.** So two `runQuery` calls awaited one
+  after the other lose the second, and the refusal says so. Issue them together with
+  `Promise.all`, which is the shape most discovery wants anyway; where an answer genuinely
+  depends on an earlier one, ask the *user* — a row they press is another click. And a
+  handler that queries first and then calls `runInTerminal` will find the run refused: put
+  the run behind its own button, which is also the honest shape of it.
+- **`runQuery` has no allowlist, and no shell either.** It takes an argv array, so quoting
+  is not a problem that exists there. The executable is a bare name looked up on your login
+  shell's PATH, or an absolute path; a relative one is refused. Output is capped at 1 MB as
+  it arrives and the command is killed at its timeout (10 s by default, 120 s at most), both
+  reported as flags rather than as failures. A non-zero exit **resolves** — `xcodebuild`
+  failing is an answer a panel has to show, not an exception.
+- **Quoting is yours the moment you type at a shell.** `runInTerminal` interpolates nothing
+  and escapes nothing: a scheme called `My App (Beta)` is three words unless the plugin
+  quotes it. Single quotes with `'\''` for an embedded quote is the whole technique;
+  `build-and-run` has it as four lines called `sh()`.
+- **Several commands are typed as one line, joined with `;`.** So `a; b` runs `b` whether or
+  not `a` worked. When the point is "and only if that worked", pass one string containing
+  `&&` yourself — the plugin owns the operators.
 - **Studio-only:** git and network. `repoIsAvailable()`, `repoCanWrite()` and
   `canReachNetwork()` answer `false` in the sandboxed App Store edition — check and explain,
   or the panel reads as broken.

@@ -1,0 +1,12 @@
+{
+  "id": "com.linelark.example.buildandrun",
+  "name": "Build and Run",
+  "version": "1.0.0",
+  "apiVersion": 12,
+  "minimumAppVersion": "1.15.0",
+  "main": "main.js",
+  "author": "Linelark",
+  "description": "Build, test and run an Xcode project without leaving the editor: pick a scheme and a destination in the side panel, and the command is typed into the terminal where you can read it and stop it.",
+  "commands": "query",
+  "terminal": "run"
+}
