@@ -1,0 +1,12 @@
+{
+  "id": "com.linelark.example.launcher",
+  "name": "Launcher",
+  "version": "1.0.0",
+  "apiVersion": 10,
+  "minimumAppVersion": "1.11.0",
+  "main": "main.js",
+  "author": "Linelark",
+  "description": "The applications a project is, in the side panel: name each one, say where it lives and what starts it, and one click runs it in a terminal you can watch and stop.",
+  "pricing": "free",
+  "terminal": "run"
+}
