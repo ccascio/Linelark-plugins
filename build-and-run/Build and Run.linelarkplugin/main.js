@@ -69,6 +69,13 @@ var state = {
     noteTint: null
 };
 
+// Which folders have been read by `xcodebuild` in *this* session, rather than remembered
+// from an earlier one. What was remembered is a fact about a folder as it was yesterday — a
+// scheme added since, a project renamed, or, the reason this exists, a value that was
+// already wrong when it was written. The first press in a folder spends itself on finding
+// out, once; every press after it is the panel behaving exactly as it did before.
+var verified = {};
+
 // MARK: - Shell quoting
 //
 // The one thing this plugin is responsible for that the host cannot do for it. `runQuery`
@@ -85,12 +92,24 @@ function sh(value) {
 // Per folder, because a window can hold several projects and the scheme chosen for one says
 // nothing about the other. Stored rather than kept in memory so that reopening the project
 // tomorrow does not mean scanning it again before anything can be pressed.
-function storageKey() {
-    return STORE_PREFIX + (state.project || linelark.folderRoot() || "");
+function projectFolder() {
+    return state.project || linelark.folderRoot() || "";
 }
 
-function remember() {
-    var refusal = linelark.storeSet(storageKey(), JSON.stringify({
+function storageKey(folder) {
+    return STORE_PREFIX + (folder === undefined ? projectFolder() : folder);
+}
+
+// The folder is written *into* the value as well as standing in its key. The key on its own
+// was enough only for as long as nothing could write one project's answer under another's —
+// and something can: the folder in front changes while `xcodebuild` is still reading the
+// last one, and what comes back is saved wherever the panel is pointing by then. A value
+// that names its own folder can be checked when it is read, so an answer from somewhere
+// else is recognisable instead of being drawn as this project's schemes.
+function remember(folder) {
+    var where = folder === undefined ? projectFolder() : folder;
+    var refusal = linelark.storeSet(storageKey(where), JSON.stringify({
+        folder: where,
         container: state.container,
         resolved: state.resolved,
         schemes: state.schemes,
@@ -103,21 +122,36 @@ function remember() {
     if (refusal) linelark.log("could not remember this project: " + refusal);
 }
 
+// Nothing known about a project, which is what a folder nobody has scanned looks like and
+// what one whose stored answer had to be thrown away should look like too.
+function forget() {
+    state.container = null;
+    state.resolved = null;
+    state.containers = [];
+    state.schemes = [];
+    state.destinations = [];
+    state.scheme = null;
+    state.destination = null;
+    state.scanned = false;
+}
+
 function recall() {
-    var raw = linelark.storeGet(storageKey());
+    var folder = projectFolder();
+    var raw = linelark.storeGet(storageKey(folder));
     if (!raw) {
-        state.container = null;
-        state.resolved = null;
-        state.containers = [];
-        state.schemes = [];
-        state.destinations = [];
-        state.scheme = null;
-        state.destination = null;
-        state.scanned = false;
+        forget();
         return;
     }
     try {
         var saved = JSON.parse(raw);
+        // Another project's answer under this folder's key. Discarded rather than drawn:
+        // its schemes are real, they are simply not the ones in front of the user, and a
+        // panel offering to build a project that is not open is worse than an empty one.
+        if (saved.folder && saved.folder !== folder) {
+            linelark.log("ignored remembered details belonging to " + saved.folder);
+            forget();
+            return;
+        }
         state.container = saved.container || null;
         state.resolved = saved.resolved || null;
         state.schemes = saved.schemes || [];
@@ -222,6 +256,10 @@ function scan(container) {
     if (!linelark.canRunQuery()) return;
 
     var folder = state.project || "";
+    // Which folder this answer will turn out to be about, resolved now rather than when it
+    // comes back: "" means the folder in front, and the folder in front can change while
+    // xcodebuild is reading.
+    var scanned = projectFolder();
     var chosen = container || state.container;
     var listing = linelark.runQuery({ command: "/bin/ls", arguments: ["-1"], folder: folder });
     var simulators = linelark.runQuery({
@@ -295,7 +333,13 @@ function scan(container) {
         if (!findDestination(state.destination)) {
             state.destination = state.destinations.length ? state.destinations[0].id : null;
         }
-        remember();
+        verified[scanned] = true;
+        remember(scanned);
+        // The window may be looking at another folder by now: a query takes the better part
+        // of a second and a click elsewhere takes none. What came back is true of the folder
+        // that was read, so it is kept under that one and the panel goes back to what it
+        // knows about the folder actually in front.
+        if (projectFolder() !== scanned) recall();
         linelark.refreshPanels();
     }).catch(function (e) {
         state.scanning = false;
@@ -544,9 +588,51 @@ function render() {
     return nodes;
 }
 
+// The scan the panel would otherwise wait for somebody to think of.
+//
+// It cannot be done when the panel opens, which is where it belongs: `runQuery` is refused
+// outside a user action — deliberately, so that nothing reads a project while nobody is at
+// the machine — and drawing a panel is not one. The first press is, and it is the moment
+// just before what was remembered starts being believed, so that is where the check goes:
+// once per folder per session, and invisible in the ordinary case where nothing has changed.
+function checkedThisSession(itemID) {
+    var folder = projectFolder();
+    if (verified[folder] || state.scanning) return false;
+    // Nothing remembered means the panel is already showing “Scan project”, and a scan that
+    // failed leaves the same button: neither needs this, and a failing scan retried on every
+    // press would be a panel that fights the user.
+    if (!state.scanned || !linelark.canRunQuery()) return false;
+    // Presses that scan by themselves, or that change which folder is being talked about.
+    if (itemID === "scan" || itemID === "rescan") return false;
+    if (itemID.indexOf("container:") === 0 || itemID.indexOf("folder:") === 0) return false;
+
+    scan(state.container);
+
+    // A build is the one press that cannot be carried out on the way past: the command is
+    // typed at the terminal inside this gesture, and the answer that says which scheme it
+    // should name is a second away. A press that says what it did instead is the honest
+    // version, and it happens at most once in a session.
+    if (itemID === "build" || itemID === "test" || itemID === "run") {
+        state.note = "Read the project again first. Press " + actionTitle(itemID) + " again.";
+        state.noteTint = "info";
+        return true;
+    }
+    // A scheme or a destination, though, is worth keeping: the scan is running, it is most
+    // likely about to confirm exactly what was pressed, and losing a click to housekeeping
+    // is the kind of small rudeness that makes a panel feel unreliable.
+    return false;
+}
+
+function actionTitle(itemID) {
+    if (itemID === "build") return "Build";
+    if (itemID === "test") return "Test";
+    return "Run";
+}
+
 // One argument, not two: the host calls a selector with the item's id alone, because a
 // panel's handler already knows which panel it was registered for.
 function onSelect(itemID) {
+    if (checkedThisSession(itemID)) return;
     if (itemID === "scan" || itemID === "rescan") {
         if (itemID === "rescan") state.scanned = false;
         scan(null);

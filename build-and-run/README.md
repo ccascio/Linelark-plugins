@@ -28,6 +28,14 @@ both switches are absent there and the panel says so.
 the simulators. Nothing is built. What comes back is remembered per folder, so reopening the
 project tomorrow does not mean scanning again.
 
+What was remembered is checked once a session, on the first press in that folder, because a
+remembered answer is only as true as the day it was stored. The check is a scan like any
+other and usually changes nothing; the one press it is visible in is **Run**, **Build** or
+**Test**, which say so and ask to be pressed again rather than building against an answer
+that is one second from being replaced. Each stored answer also names the folder it is about
+and is discarded when that is not the folder it was found under — one project's schemes
+drawn as another's is the failure this is here to prevent.
+
 Then **Scheme** and **Destination** are lists to pick from, and:
 
 - **Run** — builds and launches. On a simulator that means booting it, opening Simulator,
@@ -66,7 +74,10 @@ rather than something resolved behind the scenes.
 
 **The panel never queries to draw itself.** `render()` reads only what a previous scan left
 behind. A panel is redrawn whenever the workspace changes — a keystroke, a tab switch, a file
-saved — and `xcodebuild -list` takes the better part of a second.
+saved — and `xcodebuild -list` takes the better part of a second. It is also not a user
+action, so it *could* not query even if it wanted to: this is why the session's check hangs
+off the first press rather than off the panel opening, which is where one would first think
+to put it.
 
 **Nothing here knows what a scheme or a device is called.** There is no table of device names
 and no guess at what the schemes might be. The vocabulary of an Xcode project changes with
