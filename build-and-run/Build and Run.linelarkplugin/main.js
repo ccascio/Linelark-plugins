@@ -393,18 +393,49 @@ function xcodebuildLine(action, destination) {
 function runLine(destination) {
     var build = xcodebuildLine("build", destination);
     var products = DERIVED + "/Build/Products/" + productDirectory(destination);
-    var app = 'APP="$(ls -d ' + products + '/*.app | head -1)"';
+    // `find` rather than a `*.app` glob because the panel types this at the user's own
+    // shell: zsh treats a glob that matches nothing as an error and prints "no matches
+    // found" before `ls` ever runs, which reads like the build broke when it did not.
+    // Sorted so that a scheme producing two bundles picks the same one every time.
+    var app = 'APP="$(find ' + products + ' -maxdepth 1 -name \'*.app\' 2>/dev/null'
+        + ' | sort | head -1)"';
 
     if (destination.kind === "mac") {
-        return build + " && " + app + ' && open "$APP"';
+        // Nothing guarantees a Mac scheme produces a bundle. A SwiftPM executable product
+        // builds a bare binary where the .app would have been, so `$APP` comes back empty —
+        // and `open ""` is not an error: it hands the shell's working directory to the
+        // system Finder. A Finder window opens, the person sees an app that is not theirs,
+        // and the command exited 0. So the bundle is used when there is one, the scheme's
+        // own binary is run when there is not — it is already at a terminal, which is where
+        // a command-line product belongs — and otherwise the line says what it looked for.
+        var executable = products + "/" + sh(state.scheme);
+        return build + " && " + app
+            + ' && if [ -n "$APP" ]; then open "$APP";'
+            + " elif [ -x " + executable + " ]; then " + executable + ";"
+            + " else echo " + sh("Build and Run: the build left no .app and no executable "
+                + "named " + state.scheme + " in " + productDirectory(destination) + ".")
+            + " >&2; false; fi";
     }
     var udid = sh(destination.udid);
+    // A simulator has nothing to fall back to — `install` wants a bundle — so an empty
+    // `$APP` stops the chain here, where the reason is still legible, rather than three
+    // commands later as "an unexpected error". Written as `if` and not `[ … ] || { … }`
+    // because `&&` and `||` bind equally and left to right: the `||` form would also fire
+    // when it was the *build* that failed, and blame a missing bundle for a compile error.
+    // `false` and not `exit`: this is the user's interactive shell, and exiting it would
+    // close the terminal panel under them.
+    var required = 'if [ -z "$APP" ]; then echo '
+        + sh("Build and Run: the build left no .app in " + productDirectory(destination) + ".")
+        + " >&2; false; fi";
     // `boot` fails when the device is already booted, which is the ordinary case after the
-    // first run, so it is allowed to fail and the chain restarts after it. Everything else
-    // is `&&`: installing into a simulator that never booted, or launching something that
-    // never installed, produces a confusing error rather than a useful one.
-    return build + " && " + app
-        + " && xcrun simctl boot " + udid + " 2>/dev/null; open -a Simulator"
+    // first run, so it is allowed to fail — but inside `{ … || true; }`, not by ending the
+    // chain with `;`. A `;` here restarted the whole line: a build that did not compile
+    // still opened Simulator and still ran `install` with nothing to install, which is the
+    // confusing error the rest of this chain is written to avoid. The braces keep the one
+    // permitted failure local, and a `&&` before them still skips it when the build failed.
+    return build + " && " + app + " && " + required
+        + " && { xcrun simctl boot " + udid + " 2>/dev/null || true; }"
+        + " && open -a Simulator"
         + " && xcrun simctl install " + udid + ' "$APP"'
         + " && xcrun simctl launch " + udid
         + ' "$(/usr/libexec/PlistBuddy -c \'Print CFBundleIdentifier\' "$APP/Info.plist")"';

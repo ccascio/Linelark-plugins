@@ -40,7 +40,12 @@ Then **Scheme** and **Destination** are lists to pick from, and:
 
 - **Run** — builds and launches. On a simulator that means booting it, opening Simulator,
   installing the `.app` and launching it by the bundle identifier read out of its
-  `Info.plist`. On My Mac it means `open`ing what was built.
+  `Info.plist`. On My Mac it means `open`ing the `.app` — or, when the scheme produced no
+  bundle at all, running the binary it did produce, which is the ordinary shape of a SwiftPM
+  executable product and is already at a terminal. When there is neither, the line says which
+  directory it looked in rather than launching something. `open ""` is not an error: it hands
+  the shell's working directory to the system Finder, so the failure used to look like a
+  window of someone else's app opening on top of a build that reported success.
 - **Build** — `xcodebuild build`, and nothing else.
 - **Test** — `xcodebuild test`. The `-configuration` flag is deliberately *not* passed here:
   a scheme names its own configuration for testing, and overriding it would quietly run the
